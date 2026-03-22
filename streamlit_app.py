@@ -27,7 +27,7 @@ with st.sidebar:
         svc1 = svc2 = None
         st.markdown(f"❌ Error: {e}")
     st.markdown("---")
-    st.markdown("🟢 **Green** = Verified\n\n🟠 **Orange** = Mismatch\n\n🔴 **Red** = Not found")
+    st.markdown("🟢 **Green** = Verified\n\n🟠 **Orange** = Mismatch\n\n🔴 **Red** = Not found\n\n⬜ **Grey** = Paper invoice")
     st.caption("MTS Ventures Pty Ltd | v1.0 | Contact Sameer")
 
 uploaded_pdf = st.file_uploader("📤 Upload TIR Statement PDF", type=["pdf"])
@@ -60,7 +60,7 @@ if uploaded_pdf:
 
             def update_progress(i, total, supplier, inv_no, status):
                 pct = i / total
-                icon = "🟢" if "VERIFIED" in status else ("🟠" if "MISMATCH" in status else "🔴")
+                icon = "🟢" if "VERIFIED" in status else ("🟠" if "MISMATCH" in status else ("⬜" if "PAPER" in status else "🔴"))
                 progress_bar.progress(pct, text=f"[{i}/{total}] {supplier} — {inv_no}")
                 status_container.caption(f"{icon} {supplier} {inv_no}: {status}")
 

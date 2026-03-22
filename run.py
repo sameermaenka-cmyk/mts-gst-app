@@ -94,6 +94,27 @@ SUPPLIER_QUERY2 = {
 }
 
 
+# Suppliers that only provide paper invoices (no email).
+# These are skipped during Gmail search and marked PAPER INVOICE.
+PAPER_SUPPLIERS = {
+    'Wayside Butcher',
+    'Tas Bakeries',
+    'Sunrise Bakery',
+    'Olsen Eggs',
+    'Mountainvale',
+    'Packings',
+    'Tas Gift Wrap',
+}
+
+# Suppliers known to send weekly summary emails rather than per-invoice PDFs.
+# For these, we require the invoice number to appear in the PDF text to avoid
+# matching the summary (which has a fixed total unrelated to individual invoices).
+SUMMARY_EMAIL_SUPPLIERS = {
+    'Tasfresh',
+    'Scottsdale Pork',
+}
+
+
 def get_api_key():
     """Get Anthropic API key from env or Streamlit secrets."""
     key = os.environ.get("ANTHROPIC_API_KEY")
@@ -214,8 +235,13 @@ def extract_gst_and_total(text, client):
     return d.get('total'), d.get('gst')
 
 
-def search_and_verify(svc, query, tir_amount, inv_no, client):
-    """Search Gmail for an invoice and verify the amount matches TIR."""
+def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_text=False):
+    """Search Gmail for an invoice and verify the amount matches TIR.
+
+    If require_inv_in_text is True, the invoice number must appear in the PDF
+    text for a match to be accepted. This prevents summary emails (with a fixed
+    total) from being mistaken for individual invoices.
+    """
     try:
         msgs = _retry(
             lambda: svc.users().messages().list(userId='me', q=query, maxResults=5).execute(),
@@ -227,6 +253,9 @@ def search_and_verify(svc, query, tir_amount, inv_no, client):
 
     for m in msgs:
         for txt in read_pdfs(svc, m['id']):
+            if require_inv_in_text and inv_no not in txt:
+                log.info(f"search_and_verify: skipping msg {m['id']} — inv {inv_no} not found in PDF text")
+                continue
             try:
                 t, g = extract_gst_and_total(txt, client)
                 if t is not None and abs(abs(t) - abs(tir_amount)) < 1.00:
@@ -279,13 +308,26 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         inv_total = None
         status = 'NOT FOUND'
 
+        # Skip paper-based suppliers — no email invoices exist
+        if supplier in PAPER_SUPPLIERS:
+            status = 'PAPER INVOICE'
+            results.append((date, supplier, inv_no, tir_amount, gst, inv_total, status))
+            if progress_callback:
+                progress_callback(i + 1, total_count, supplier, inv_no, status)
+            continue
+
+        # For summary-email suppliers, require invoice number in PDF text
+        # to avoid matching weekly summary emails with fixed totals
+        needs_inv_check = supplier in SUMMARY_EMAIL_SUPPLIERS
+
         q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
         queries_email1 = [q for q in [q_specific, f'subject:{inv_no} has:attachment -from:tir.com.au'] if q.strip()]
 
         # Try label query on email 1
         lq = LABEL_QUERY.get(supplier)
         if lq:
-            g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client)
+            g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
+                                         require_inv_in_text=needs_inv_check)
             if s and 'VERIFIED' in s:
                 gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
             elif s and gst is None:
@@ -295,7 +337,8 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         for q in queries_email1:
             if 'VERIFIED' in status:
                 break
-            g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client)
+            g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
+                                         require_inv_in_text=needs_inv_check)
             if s and 'VERIFIED' in s:
                 gst, inv_total, status = g, t, s
             elif s:
@@ -307,7 +350,8 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
             q2_specific = q2_tmpl.replace('{inv}', inv_no)
             queries_email2 = [q2_specific, f'subject:{inv_no} has:attachment -from:tir.com.au']
             for q in queries_email2:
-                g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client)
+                g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client,
+                                             require_inv_in_text=needs_inv_check)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
                     break
@@ -345,6 +389,7 @@ def build_excel(results, title_date=''):
     green = PatternFill('solid', start_color='E8F5E9')
     orange = PatternFill('solid', start_color='FFF3E0')
     red = PatternFill('solid', start_color='FFEBEE')
+    grey = PatternFill('solid', start_color='F5F5F5')
     total_gst = 0
     verified_count = 0
 
@@ -357,6 +402,9 @@ def build_excel(results, title_date=''):
             if gst:
                 total_gst += gst
             verified_count += 1
+        elif 'PAPER INVOICE' in status:
+            for c in row:
+                c.fill = grey
         elif 'MISMATCH' in status:
             for c in row:
                 c.fill = orange
