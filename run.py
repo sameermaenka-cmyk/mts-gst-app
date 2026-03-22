@@ -83,9 +83,16 @@ def get_service(token_path):
     return build('gmail', 'v1', credentials=creds)
 
 
-def get_service_from_json(token_json):
-    """Build Gmail API service from token JSON string."""
-    info = json.loads(token_json)
+def get_service_from_json(token_data):
+    """Build Gmail API service from token JSON string or dict."""
+    if isinstance(token_data, dict):
+        info = dict(token_data)
+    elif isinstance(token_data, str):
+        # Strip wrapping quotes that Render/TOML may add
+        s = token_data.strip().strip("'\"")
+        info = json.loads(s)
+    else:
+        info = dict(token_data)
     creds = Credentials.from_authorized_user_info(info)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
