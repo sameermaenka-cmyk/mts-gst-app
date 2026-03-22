@@ -1,9 +1,41 @@
-import os, base64, io, json, re
+import os, base64, io, json, re, time, logging
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 import pdfplumber, anthropic, openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+
+log = logging.getLogger(__name__)
+
+# Cache: msg_id -> list of extracted PDF text strings
+_pdf_text_cache = {}
+
+MAX_RETRIES = 3
+RETRY_DELAYS = [2, 5, 10]
+
+
+def _retry(fn, description="operation"):
+    """Retry fn() on transient errors (rate limits, server errors)."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn()
+        except anthropic.RateLimitError as e:
+            delay = RETRY_DELAYS[attempt]
+            log.warning(f"{description}: rate limited, retrying in {delay}s (attempt {attempt+1})")
+            time.sleep(delay)
+        except anthropic.InternalServerError as e:
+            delay = RETRY_DELAYS[attempt]
+            log.warning(f"{description}: server error, retrying in {delay}s (attempt {attempt+1})")
+            time.sleep(delay)
+        except HttpError as e:
+            if e.resp.status in (429, 500, 503):
+                delay = RETRY_DELAYS[attempt]
+                log.warning(f"{description}: Gmail {e.resp.status}, retrying in {delay}s (attempt {attempt+1})")
+                time.sleep(delay)
+            else:
+                raise
+    return fn()
 
 
 SUPPLIER_QUERY = {
@@ -133,10 +165,15 @@ def get_services():
 
 
 def read_pdfs(svc, msg_id):
-    """Extract text from PDF attachments in a Gmail message."""
+    """Extract text from PDF attachments in a Gmail message. Results are cached by msg_id."""
+    if msg_id in _pdf_text_cache:
+        return _pdf_text_cache[msg_id]
+
     texts = []
     try:
-        msg = svc.users().messages().get(userId='me', id=msg_id, format='full').execute()
+        msg = _retry(
+            lambda: svc.users().messages().get(userId='me', id=msg_id, format='full').execute(),
+            f"Gmail get message {msg_id}")
 
         def scan(parts):
             for p in parts:
@@ -145,63 +182,80 @@ def read_pdfs(svc, msg_id):
                 if p.get('filename', '').lower().endswith('.pdf'):
                     aid = p.get('body', {}).get('attachmentId')
                     if aid:
-                        att = svc.users().messages().attachments().get(
-                            userId='me', messageId=msg_id, id=aid).execute()
+                        att = _retry(
+                            lambda aid=aid: svc.users().messages().attachments().get(
+                                userId='me', messageId=msg_id, id=aid).execute(),
+                            f"Gmail get attachment {msg_id}")
                         data = base64.urlsafe_b64decode(att['data'])
                         with pdfplumber.open(io.BytesIO(data)) as pdf:
                             t = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
                             if t.strip():
                                 texts.append(t)
         scan(msg.get('payload', {}).get('parts', []))
-    except Exception:
-        pass
+    except (HttpError, Exception) as e:
+        log.warning(f"read_pdfs({msg_id}): {type(e).__name__}: {e}")
+
+    _pdf_text_cache[msg_id] = texts
     return texts
 
 
-def extract_gst_and_total(text, api_key):
-    """Use Claude to extract total and GST from invoice text."""
-    client = anthropic.Anthropic(api_key=api_key)
-    r = client.messages.create(
-        model='claude-sonnet-4-20250514', max_tokens=150,
-        messages=[{'role': 'user', 'content':
-            f'From this invoice extract TOTAL AMOUNT DUE and TOTAL GST INCLUDED. '
-            f'Return ONLY JSON: {{"total":0.00,"gst":0.00}}\n\n{text[-2000:]}'}])
+def extract_gst_and_total(text, client):
+    """Use Claude Haiku to extract total and GST from invoice text."""
+    def _call():
+        return client.messages.create(
+            model='claude-haiku-4-5-20251001', max_tokens=150,
+            messages=[{'role': 'user', 'content':
+                f'From this invoice extract TOTAL AMOUNT DUE and TOTAL GST INCLUDED. '
+                f'Return ONLY JSON: {{"total":0.00,"gst":0.00}}\n\n{text[-2000:]}'}])
+
+    r = _retry(_call, "Claude extract GST")
     t = re.sub(r'```json|```', '', r.content[0].text).strip()
     d = json.loads(t[t.find('{'):t.rfind('}') + 1])
     return d.get('total'), d.get('gst')
 
 
-def search_and_verify(svc, query, tir_amount, inv_no, api_key):
+def search_and_verify(svc, query, tir_amount, inv_no, client):
     """Search Gmail for an invoice and verify the amount matches TIR."""
-    msgs = svc.users().messages().list(userId='me', q=query, maxResults=5).execute().get('messages', [])
+    try:
+        msgs = _retry(
+            lambda: svc.users().messages().list(userId='me', q=query, maxResults=5).execute(),
+            f"Gmail search '{query[:50]}'"
+        ).get('messages', [])
+    except Exception as e:
+        log.warning(f"search_and_verify: Gmail search failed: {type(e).__name__}: {e}")
+        return None, None, None
+
     for m in msgs:
         for txt in read_pdfs(svc, m['id']):
             try:
-                t, g = extract_gst_and_total(txt, api_key)
+                t, g = extract_gst_and_total(txt, client)
                 if t is not None and abs(abs(t) - abs(tir_amount)) < 1.00:
                     return g, t, 'VERIFIED ✓'
                 elif t is not None:
                     return g, t, f'AMOUNT MISMATCH (PDF:{t} TIR:{tir_amount})'
-            except Exception:
-                pass
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                log.warning(f"search_and_verify: parse error for msg {m['id']}: {e}")
+            except Exception as e:
+                log.warning(f"search_and_verify: unexpected error for msg {m['id']}: {type(e).__name__}: {e}")
     return None, None, None
 
 
-def parse_tir_pdf(pdf_bytes, api_key):
+def parse_tir_pdf(pdf_bytes, client):
     """Parse a TIR statement PDF into a list of (date, supplier, inv_no, amount) tuples."""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         full_text = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
 
-    client = anthropic.Anthropic(api_key=api_key)
-    r = client.messages.create(
-        model='claude-sonnet-4-20250514', max_tokens=8000,
-        messages=[{'role': 'user', 'content':
-            'Extract ALL invoice line items from this TIR statement. '
-            'For each line return: date (DD/MM/YYYY), supplier name, invoice number, and amount (as a number, negative for credits). '
-            'Return ONLY a JSON array of arrays: [["06/03/2026","Supplier Name","INV123",427.62], ...]\n'
-            'Include every single line item. Do not skip any.\n\n'
-            f'{full_text}'}])
+    def _call():
+        return client.messages.create(
+            model='claude-sonnet-4-20250514', max_tokens=8000,
+            messages=[{'role': 'user', 'content':
+                'Extract ALL invoice line items from this TIR statement. '
+                'For each line return: date (DD/MM/YYYY), supplier name, invoice number, and amount (as a number, negative for credits). '
+                'Return ONLY a JSON array of arrays: [["06/03/2026","Supplier Name","INV123",427.62], ...]\n'
+                'Include every single line item. Do not skip any.\n\n'
+                f'{full_text}'}])
 
+    r = _retry(_call, "Claude parse TIR PDF")
     text = re.sub(r'```json|```', '', r.content[0].text).strip()
     data = json.loads(text[text.find('['):text.rfind(']') + 1])
     return [(row[0], row[1], str(row[2]), float(row[3])) for row in data]
@@ -212,6 +266,11 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
 
     progress_callback(i, total, supplier, inv_no, status) is called after each invoice.
     """
+    # Single client reused for all Claude calls
+    client = anthropic.Anthropic(api_key=api_key)
+    # Clear PDF text cache from any previous run
+    _pdf_text_cache.clear()
+
     results = []
     total_count = len(tir_data)
 
@@ -226,7 +285,7 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         # Try label query on email 1
         lq = LABEL_QUERY.get(supplier)
         if lq:
-            g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, api_key)
+            g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client)
             if s and 'VERIFIED' in s:
                 gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
             elif s and gst is None:
@@ -236,7 +295,7 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         for q in queries_email1:
             if 'VERIFIED' in status:
                 break
-            g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, api_key)
+            g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client)
             if s and 'VERIFIED' in s:
                 gst, inv_total, status = g, t, s
             elif s:
@@ -248,7 +307,7 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
             q2_specific = q2_tmpl.replace('{inv}', inv_no)
             queries_email2 = [q2_specific, f'subject:{inv_no} has:attachment -from:tir.com.au']
             for q in queries_email2:
-                g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, api_key)
+                g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
                     break

@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import anthropic
 from run import get_api_key, get_services, parse_tir_pdf, reconcile, build_excel
 
 st.set_page_config(page_title="MTS TIR GST Reconciliation", page_icon="🏪", layout="wide")
@@ -39,12 +40,13 @@ if uploaded_pdf:
             st.error("❌ Cannot run — API key or Gmail tokens not configured. Check sidebar for details.")
         else:
             pdf_bytes = uploaded_pdf.getvalue()
+            client = anthropic.Anthropic(api_key=api_key)
 
             # Step 1: Parse TIR PDF
             with st.status("📄 Parsing TIR statement...", expanded=True) as parse_status:
                 st.write("Extracting invoice data from the uploaded PDF...")
                 try:
-                    tir_data = parse_tir_pdf(pdf_bytes, api_key)
+                    tir_data = parse_tir_pdf(pdf_bytes, client)
                     st.write(f"Found **{len(tir_data)} invoices** across "
                              f"**{len(set(r[1] for r in tir_data))} suppliers**")
                     parse_status.update(label=f"📄 Parsed {len(tir_data)} invoices", state="complete")
