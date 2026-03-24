@@ -93,8 +93,8 @@ if uploaded_pdf:
 
             # Results table
             verified_rows = [(r[0], r[1], r[2], f"${r[3]:,.2f}",
-                              f"${r[5]:,.2f}" if r[5] else "–",
                               f"${r[4]:,.2f}" if r[4] else "–",
+                              f"${r[5]:,.2f}" if r[5] else "–",
                               r[6]) for r in results]
             st.dataframe(
                 [dict(zip(['Date', 'Supplier', 'Invoice', 'TIR Amount', 'GST', 'Invoice Total', 'Status'], row))
