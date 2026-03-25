@@ -79,7 +79,7 @@ SUPPLIER_QUERY2 = {
     'Nichols Poultry':  'subject:{inv} has:attachment',
     'PFD':              'from:pfdfoods.com.au has:attachment',
     'Petuna Fisherie':  'from:petuna has:attachment',
-    'Tasfresh':         'from:tasfresh.com.au has:attachment',
+    'Tasfresh':         'from:accounts.receivable@tasfresh.com.au subject:"Tasfresh AR Invoice for 30349 CAMPBELL TOWN" has:attachment',
     'Scottsdale Pork':  'from:fresho.com has:attachment',
     'Tas Bakeries':     'from:tasmanianbakeries.com.au has:attachment',
     'Sunrise Bakery':   'from:sunrise has:attachment',
@@ -110,8 +110,13 @@ PAPER_SUPPLIERS = {
 # For these, we require the invoice number to appear in the PDF text to avoid
 # matching the summary (which has a fixed total unrelated to individual invoices).
 SUMMARY_EMAIL_SUPPLIERS = {
-    'Tasfresh',
     'Scottsdale Pork',
+}
+
+# Suppliers whose invoices arrive on EMAIL2 only.
+# Skip email1 searches entirely for these to avoid wasting time.
+EMAIL2_ONLY_SUPPLIERS = {
+    'Tasfresh',
 }
 
 
@@ -320,29 +325,31 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         # to avoid matching weekly summary emails with fixed totals
         needs_inv_check = supplier in SUMMARY_EMAIL_SUPPLIERS
 
-        q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
-        queries_email1 = [q for q in [q_specific, f'subject:{inv_no} has:attachment -from:tir.com.au'] if q.strip()]
+        # Skip email1 entirely for suppliers that only receive on email2
+        if supplier not in EMAIL2_ONLY_SUPPLIERS:
+            q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
+            queries_email1 = [q for q in [q_specific, f'subject:{inv_no} has:attachment -from:tir.com.au'] if q.strip()]
 
-        # Try label query on email 1
-        lq = LABEL_QUERY.get(supplier)
-        if lq:
-            g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
-                                         require_inv_in_text=needs_inv_check)
-            if s and 'VERIFIED' in s:
-                gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
-            elif s and gst is None:
-                gst, inv_total, status = g, t, s
+            # Try label query on email 1
+            lq = LABEL_QUERY.get(supplier)
+            if lq:
+                g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
+                                             require_inv_in_text=needs_inv_check)
+                if s and 'VERIFIED' in s:
+                    gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
+                elif s and gst is None:
+                    gst, inv_total, status = g, t, s
 
-        # Try email 1 specific queries
-        for q in queries_email1:
-            if 'VERIFIED' in status:
-                break
-            g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
-                                         require_inv_in_text=needs_inv_check)
-            if s and 'VERIFIED' in s:
-                gst, inv_total, status = g, t, s
-            elif s:
-                gst, inv_total, status = g, t, s
+            # Try email 1 specific queries
+            for q in queries_email1:
+                if 'VERIFIED' in status:
+                    break
+                g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
+                                             require_inv_in_text=needs_inv_check)
+                if s and 'VERIFIED' in s:
+                    gst, inv_total, status = g, t, s
+                elif s:
+                    gst, inv_total, status = g, t, s
 
         # Try email 2 if not verified yet
         if 'VERIFIED' not in status and svc2:
