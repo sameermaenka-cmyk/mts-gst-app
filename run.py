@@ -50,7 +50,7 @@ SUPPLIER_QUERY = {
     'News Corp':      'from:circulation.news.com.au has:attachment',
     'Pandani Select': 'from:pandaniselect.com.au subject:{inv}',
     'Savour Foods':   'from:savourfoods.com.au subject:{inv}',
-    'Scottsdale Pork':'from:fresho.com subject:{inv}',
+    'Scottsdale Pork':'from:fresho.com subject:F{inv}',
 }
 
 LABEL_QUERY = {
@@ -80,7 +80,7 @@ SUPPLIER_QUERY2 = {
     'PFD':              'from:pfdfoods.com.au has:attachment',
     'Petuna Fisherie':  'from:petuna has:attachment',
     'Tasfresh':         'from:accounts.receivable@tasfresh.com.au subject:"Tasfresh AR Invoice for 30349 CAMPBELL TOWN" has:attachment',
-    'Scottsdale Pork':  'from:fresho.com has:attachment',
+    'Scottsdale Pork':  'from:fresho.com subject:F{inv} has:attachment',
     'Tas Bakeries':     'from:tasmanianbakeries.com.au has:attachment',
     'Sunrise Bakery':   'from:sunrise has:attachment',
     'Cartel & Co':      'from:cartelco.co has:attachment',
@@ -109,14 +109,18 @@ PAPER_SUPPLIERS = {
 # Suppliers known to send weekly summary emails rather than per-invoice PDFs.
 # For these, we require the invoice number to appear in the PDF text to avoid
 # matching the summary (which has a fixed total unrelated to individual invoices).
-SUMMARY_EMAIL_SUPPLIERS = {
-    'Scottsdale Pork',
-}
+SUMMARY_EMAIL_SUPPLIERS = set()
 
 # Suppliers whose invoices arrive on EMAIL2 only.
 # Skip email1 searches entirely for these to avoid wasting time.
 EMAIL2_ONLY_SUPPLIERS = {
     'Tasfresh',
+}
+
+# Suppliers whose email invoice numbers have a prefix not in the TIR statement.
+# e.g. TIR shows "51602430" but the email subject has "F51602430".
+INV_EMAIL_PREFIX = {
+    'Scottsdale Pork': 'F',
 }
 
 
@@ -325,10 +329,13 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         # to avoid matching weekly summary emails with fixed totals
         needs_inv_check = supplier in SUMMARY_EMAIL_SUPPLIERS
 
+        # Some suppliers prefix invoice numbers in emails (e.g. F51602430 vs TIR 51602430)
+        email_inv_no = INV_EMAIL_PREFIX.get(supplier, '') + inv_no
+
         # Skip email1 entirely for suppliers that only receive on email2
         if supplier not in EMAIL2_ONLY_SUPPLIERS:
             q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
-            queries_email1 = [q for q in [q_specific, f'subject:{inv_no} has:attachment -from:tir.com.au'] if q.strip()]
+            queries_email1 = [q for q in [q_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au'] if q.strip()]
 
             # Try label query on email 1
             lq = LABEL_QUERY.get(supplier)
@@ -353,9 +360,9 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
 
         # Try email 2 if not verified yet
         if 'VERIFIED' not in status and svc2:
-            q2_tmpl = SUPPLIER_QUERY2.get(supplier, f'subject:{inv_no} has:attachment')
+            q2_tmpl = SUPPLIER_QUERY2.get(supplier, f'subject:{email_inv_no} has:attachment')
             q2_specific = q2_tmpl.replace('{inv}', inv_no)
-            queries_email2 = [q2_specific, f'subject:{inv_no} has:attachment -from:tir.com.au']
+            queries_email2 = [q2_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au']
             for q in queries_email2:
                 g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client,
                                              require_inv_in_text=needs_inv_check)
