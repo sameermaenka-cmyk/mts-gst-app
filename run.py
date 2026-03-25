@@ -76,7 +76,7 @@ LABEL_QUERY = {
 SUPPLIER_QUERY2 = {
     'Cripps Nu Bake':   'from:cripps.com.au has:attachment',
     'Wayside Butcher':  'from:wayside has:attachment',
-    'Nichols Poultry':  'subject:{inv} has:attachment',
+    'Nichols Poultry':  'subject:"Invoice(s) from Nichols Poultry P/L" has:attachment',
     'PFD':              'from:pfdfoods.com.au has:attachment',
     'Petuna Fisherie':  'from:petuna has:attachment',
     'Tasfresh':         'from:accounts.receivable@tasfresh.com.au subject:"Tasfresh AR Invoice for 30349 CAMPBELL TOWN" has:attachment',
@@ -115,12 +115,19 @@ SUMMARY_EMAIL_SUPPLIERS = set()
 # Skip email1 searches entirely for these to avoid wasting time.
 EMAIL2_ONLY_SUPPLIERS = {
     'Tasfresh',
+    'Nichols Poultry',
 }
 
 # Suppliers whose email invoice numbers have a prefix not in the TIR statement.
 # e.g. TIR shows "51602430" but the email subject has "F51602430".
 INV_EMAIL_PREFIX = {
     'Scottsdale Pork': 'F',
+}
+
+# Suppliers where the invoice number is in the attachment filename, not the subject.
+# These need attachment-level matching instead of subject-based search.
+ATTACHMENT_MATCH_SUPPLIERS = {
+    'Nichols Poultry',
 }
 
 
@@ -278,6 +285,68 @@ def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_tex
     return None, None, None
 
 
+def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
+    """Search Gmail and match invoice by attachment filename (e.g. Invoice554148.P).
+
+    Used for suppliers like Nichols Poultry where every email has the same subject
+    and the invoice number only appears in the attachment filename.
+    """
+    try:
+        msgs = _retry(
+            lambda: svc.users().messages().list(userId='me', q=query, maxResults=5).execute(),
+            f"Gmail search '{query[:50]}'"
+        ).get('messages', [])
+    except Exception as e:
+        log.warning(f"search_and_verify_by_attachment: Gmail search failed: {type(e).__name__}: {e}")
+        return None, None, None
+
+    for m in msgs:
+        msg_id = m['id']
+        try:
+            msg = _retry(
+                lambda mid=msg_id: svc.users().messages().get(userId='me', id=mid, format='full').execute(),
+                f"Gmail get message {msg_id}")
+        except Exception as e:
+            log.warning(f"search_and_verify_by_attachment({msg_id}): {type(e).__name__}: {e}")
+            continue
+
+        # Scan all parts for attachments whose filename contains the invoice number
+        matches = []
+
+        def scan(parts):
+            for p in parts:
+                if p.get('parts'):
+                    scan(p['parts'])
+                fname = p.get('filename', '')
+                if fname and inv_no in fname:
+                    aid = p.get('body', {}).get('attachmentId')
+                    if aid:
+                        matches.append((fname, aid))
+
+        scan(msg.get('payload', {}).get('parts', []))
+
+        for fname, aid in matches:
+            try:
+                att = _retry(
+                    lambda aid=aid, mid=msg_id: svc.users().messages().attachments().get(
+                        userId='me', messageId=mid, id=aid).execute(),
+                    f"Gmail get attachment {fname}")
+                data = base64.urlsafe_b64decode(att['data'])
+                with pdfplumber.open(io.BytesIO(data)) as pdf:
+                    txt = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
+                if not txt.strip():
+                    continue
+                t, g = extract_gst_and_total(txt, client)
+                if t is not None and abs(abs(t) - abs(tir_amount)) < 1.00:
+                    return g, t, 'VERIFIED ✓'
+                elif t is not None:
+                    return g, t, f'AMOUNT MISMATCH (PDF:{t} TIR:{tir_amount})'
+            except Exception as e:
+                log.warning(f"search_and_verify_by_attachment: error processing {fname} in {msg_id}: {e}")
+
+    return None, None, None
+
+
 def parse_tir_pdf(pdf_bytes, client):
     """Parse a TIR statement PDF into a list of (date, supplier, inv_no, amount) tuples."""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -362,15 +431,25 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         if 'VERIFIED' not in status and svc2:
             q2_tmpl = SUPPLIER_QUERY2.get(supplier, f'subject:{email_inv_no} has:attachment')
             q2_specific = q2_tmpl.replace('{inv}', inv_no)
-            queries_email2 = [q2_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au']
-            for q in queries_email2:
-                g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client,
-                                             require_inv_in_text=needs_inv_check)
+
+            # For suppliers where the invoice number is in the attachment filename,
+            # use attachment-based matching instead of subject/text matching
+            if supplier in ATTACHMENT_MATCH_SUPPLIERS:
+                g, t, s = search_and_verify_by_attachment(svc2, q2_specific, tir_amount, inv_no, client)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
-                    break
                 elif s and 'MISMATCH' not in status:
                     gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
+            else:
+                queries_email2 = [q2_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au']
+                for q in queries_email2:
+                    g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client,
+                                                 require_inv_in_text=needs_inv_check)
+                    if s and 'VERIFIED' in s:
+                        gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
+                        break
+                    elif s and 'MISMATCH' not in status:
+                        gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
 
         results.append((date, supplier, inv_no, tir_amount, gst, inv_total, status))
 
