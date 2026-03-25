@@ -364,6 +364,27 @@ def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_tex
     return None, None, None
 
 
+def _filename_matches_inv(fname, inv_no):
+    """Check if a filename contains the invoice number.
+
+    Handles patterns like:
+      InvoiceFRS2002177B.pdf → extracts 2002177, matches inv_no '2002177'
+      InvoiceLAU4526767.pdf  → extracts 4526767, matches inv_no '4526767'
+      Invoice554148.P        → extracts 554148,  matches inv_no '554148'
+      INV00024807.p          → zero-stripped match, matches inv_no '24807'
+    """
+    # Extract all digit sequences from filename
+    digits = re.findall(r'\d+', fname)
+    # Exact match against any extracted number
+    if inv_no in digits:
+        return True
+    # Zero-stripped comparison (handles zero-padded numbers like 00024807 matching 24807)
+    inv_stripped = inv_no.lstrip('0') or inv_no
+    if any(d.lstrip('0') == inv_stripped for d in digits):
+        return True
+    return False
+
+
 def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
     """Search Gmail and match invoice by attachment filename (e.g. Invoice554148.P).
 
@@ -393,7 +414,7 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
                 fname = p.get('filename', '')
                 if fname:
                     all_filenames.append(fname)
-                    if inv_no in fname:
+                    if _filename_matches_inv(fname, inv_no):
                         aid = p.get('body', {}).get('attachmentId')
                         if aid:
                             matches.append((fname, aid))
@@ -403,7 +424,7 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
         if payload.get('parts'):
             scan(payload['parts'])
         # Some emails have the attachment at the top level (single-part)
-        if payload.get('filename') and inv_no in payload.get('filename', ''):
+        if payload.get('filename') and _filename_matches_inv(payload.get('filename', ''), inv_no):
             aid = payload.get('body', {}).get('attachmentId')
             if aid:
                 matches.append((payload['filename'], aid))
