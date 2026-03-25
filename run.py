@@ -85,7 +85,7 @@ SUPPLIER_QUERY2 = {
     'Sunrise Bakery':   'from:sunrise has:attachment',
     'Cartel & Co':      'from:cartelco.co has:attachment',
     'Licensed Socks':   'subject:{inv} has:attachment',
-    'Horticultural L':  'subject:{inv} has:attachment',
+    'Horticultural L':  'from:dpritchard@hals.com.au subject:"HALS Invoice" has:attachment',
     'Natures Foods':    'subject:{inv} has:attachment',
     'Olsen Eggs':       'subject:{inv} has:attachment',
     'Bega':             'from:noreplyBDD@bega.com.au has:attachment',
@@ -116,6 +116,7 @@ SUMMARY_EMAIL_SUPPLIERS = set()
 EMAIL2_ONLY_SUPPLIERS = {
     'Tasfresh',
     'Nichols Poultry',
+    'Horticultural L',
 }
 
 # Suppliers whose email invoice numbers have a prefix not in the TIR statement.
@@ -128,6 +129,12 @@ INV_EMAIL_PREFIX = {
 # These need attachment-level matching instead of subject-based search.
 ATTACHMENT_MATCH_SUPPLIERS = {
     'Nichols Poultry',
+}
+
+# Suppliers where the TIR invoice number differs from the email invoice number.
+# Match by sender and approximate amount only — skip invoice-number-based fallback queries.
+AMOUNT_MATCH_SUPPLIERS = {
+    'Horticultural L',
 }
 
 
@@ -436,6 +443,14 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
             # use attachment-based matching instead of subject/text matching
             if supplier in ATTACHMENT_MATCH_SUPPLIERS:
                 g, t, s = search_and_verify_by_attachment(svc2, q2_specific, tir_amount, inv_no, client)
+                if s and 'VERIFIED' in s:
+                    gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
+                elif s and 'MISMATCH' not in status:
+                    gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
+            elif supplier in AMOUNT_MATCH_SUPPLIERS:
+                # TIR invoice number differs from email — match by sender + amount only.
+                # Only use the specific supplier query; skip generic invoice-number fallback.
+                g, t, s = search_and_verify(svc2, q2_specific, tir_amount, inv_no, client)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
                 elif s and 'MISMATCH' not in status:
