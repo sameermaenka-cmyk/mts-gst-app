@@ -85,16 +85,16 @@ LABEL_QUERY = {
 SUPPLIER_QUERY2 = {
     'Cripps Nu Bake':   'from:administration@cripps.com.au subject:"Cripps Invoice" has:attachment',
     'Wayside Butcher':  'from:wayside has:attachment',
-    'Nichols Poultry':  'subject:"Invoice(s) from Nichols Poultry P/L" has:attachment',
+    'Nichols Poultry':  'subject:"Nichols Poultry" has:attachment',
     'PFD':              'from:pfdfoods.com.au has:attachment',
     'Petuna Fisherie':  'from:petuna has:attachment',
-    'Tasfresh':         'from:accounts.receivable@tasfresh.com.au subject:"Tasfresh AR Invoice for 30349 CAMPBELL TOWN" has:attachment',
+    'Tasfresh':         'from:accounts.receivable@tasfresh.com.au subject:"Tasfresh AR Invoice" has:attachment',
     'Scottsdale Pork':  'from:fresho.com subject:Invoice subject:F{inv} has:attachment',
     'Tas Bakeries':     'from:tasmanianbakeries.com.au has:attachment',
     'Sunrise Bakery':   'from:sunrise has:attachment',
     'Cartel & Co':      'from:cartelco.co has:attachment',
-    'Licensed Socks':   'subject:islandwide has:attachment',
     'Horticultural L':  'from:dpritchard@hals.com.au subject:"HALS Invoice" has:attachment',
+    'Natures Foods':    'subject:"From Natures Foods" has:attachment',
     'Olsen Eggs':       'subject:{inv} has:attachment',
     'Bega':             'from:noreplyBDD@bega.com.au has:attachment',
     'Bidfood':          'from:bidfood.com.au has:attachment',
@@ -110,6 +110,7 @@ PAPER_SUPPLIERS = {
     'Olsen Eggs',
     'Mountainvale',
     'Packings',
+    'Licensed Socks',
 }
 
 # Suppliers known to send weekly summary emails rather than per-invoice PDFs.
@@ -124,7 +125,8 @@ EMAIL2_ONLY_SUPPLIERS = {
     'Nichols Poultry',
     'Horticultural L',
     'Cripps Nu Bake',
-    'Licensed Socks',
+    'Natures Foods',
+    'Petuna Fisherie',
 }
 
 # Suppliers whose email invoice numbers have a prefix not in the TIR statement.
@@ -139,7 +141,6 @@ ATTACHMENT_MATCH_SUPPLIERS = {
     'Nichols Poultry',
     'Natures Foods',
     'Tasfresh',
-    'Licensed Socks',
 }
 
 # Suppliers where the TIR invoice number differs from the email invoice number.
@@ -153,6 +154,7 @@ AMOUNT_MATCH_SUPPLIERS = {
 # the single email invoice total. GST is distributed proportionally.
 WEEKLY_INVOICE_SUPPLIERS = {
     'Cripps Nu Bake',
+    'Tas Bakeries',
 }
 
 
@@ -321,6 +323,9 @@ def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_tex
     """
     msgs = _gmail_search(svc, query)
 
+    # Track first mismatch as fallback — don't stop on first non-matching PDF,
+    # keep trying other messages to find the right invoice.
+    first_mismatch = None
     for m in msgs:
         for txt in read_pdfs(svc, m['id']):
             if require_inv_in_text and inv_no not in txt:
@@ -330,12 +335,14 @@ def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_tex
                 t, g = extract_gst_and_total(txt, client)
                 if t is not None and abs(abs(t) - abs(tir_amount)) < 1.00:
                     return g, t, 'VERIFIED ✓'
-                elif t is not None:
-                    return g, t, f'AMOUNT MISMATCH (PDF:{t} TIR:{tir_amount})'
+                elif t is not None and first_mismatch is None:
+                    first_mismatch = (g, t, f'AMOUNT MISMATCH (PDF:{t} TIR:{tir_amount})')
             except (json.JSONDecodeError, KeyError, IndexError) as e:
                 log.warning(f"search_and_verify: parse error for msg {m['id']}: {e}")
             except Exception as e:
                 log.warning(f"search_and_verify: unexpected error for msg {m['id']}: {type(e).__name__}: {e}")
+    if first_mismatch:
+        return first_mismatch
     return None, None, None
 
 
@@ -347,6 +354,7 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
     """
     msgs = _gmail_search(svc, query)
 
+    first_mismatch = None
     for m in msgs:
         msg_id = m['id']
         try:
@@ -381,11 +389,13 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
                 t, g = extract_gst_and_total(txt, client)
                 if t is not None and abs(abs(t) - abs(tir_amount)) < 1.00:
                     return g, t, 'VERIFIED ✓'
-                elif t is not None:
-                    return g, t, f'AMOUNT MISMATCH (PDF:{t} TIR:{tir_amount})'
+                elif t is not None and first_mismatch is None:
+                    first_mismatch = (g, t, f'AMOUNT MISMATCH (PDF:{t} TIR:{tir_amount})')
             except Exception as e:
                 log.warning(f"search_and_verify_by_attachment: error processing {fname} in {msg_id}: {e}")
 
+    if first_mismatch:
+        return first_mismatch
     return None, None, None
 
 
