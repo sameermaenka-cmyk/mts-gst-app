@@ -50,9 +50,10 @@ SUPPLIER_QUERY = {
     'News Corp':      'from:circulation.news.com.au has:attachment',
     'Pandani Select': 'from:pandaniselect.com.au subject:{inv}',
     'Savour Foods':   'from:savourfoods.com.au subject:{inv}',
-    'Scottsdale Pork':'from:fresho.com subject:F{inv}',
+    'Scottsdale Pork':'from:fresho.com subject:Invoice subject:F{inv}',
     'Natures Foods':  'subject:"From Natures Foods" has:attachment',
     'Tas Bakeries':   'from:tasmanianbakeries.com.au subject:"Invoice from Tasmanian Bakeries" has:attachment',
+    'Tas Gift Wrap':  'from:taswrap.com.au subject:INV{inv} has:attachment',
 }
 
 LABEL_QUERY = {
@@ -82,11 +83,11 @@ SUPPLIER_QUERY2 = {
     'PFD':              'from:pfdfoods.com.au has:attachment',
     'Petuna Fisherie':  'from:petuna has:attachment',
     'Tasfresh':         'from:accounts.receivable@tasfresh.com.au subject:"Tasfresh AR Invoice for 30349 CAMPBELL TOWN" has:attachment',
-    'Scottsdale Pork':  'from:fresho.com subject:F{inv} has:attachment',
+    'Scottsdale Pork':  'from:fresho.com subject:Invoice subject:F{inv} has:attachment',
     'Tas Bakeries':     'from:tasmanianbakeries.com.au has:attachment',
     'Sunrise Bakery':   'from:sunrise has:attachment',
     'Cartel & Co':      'from:cartelco.co has:attachment',
-    'Licensed Socks':   'subject:{inv} has:attachment',
+    'Licensed Socks':   'subject:islandwide has:attachment',
     'Horticultural L':  'from:dpritchard@hals.com.au subject:"HALS Invoice" has:attachment',
     'Olsen Eggs':       'subject:{inv} has:attachment',
     'Bega':             'from:noreplyBDD@bega.com.au has:attachment',
@@ -103,7 +104,6 @@ PAPER_SUPPLIERS = {
     'Olsen Eggs',
     'Mountainvale',
     'Packings',
-    'Tas Gift Wrap',
 }
 
 # Suppliers known to send weekly summary emails rather than per-invoice PDFs.
@@ -118,6 +118,7 @@ EMAIL2_ONLY_SUPPLIERS = {
     'Nichols Poultry',
     'Horticultural L',
     'Cripps Nu Bake',
+    'Licensed Socks',
 }
 
 # Suppliers whose email invoice numbers have a prefix not in the TIR statement.
@@ -131,6 +132,8 @@ INV_EMAIL_PREFIX = {
 ATTACHMENT_MATCH_SUPPLIERS = {
     'Nichols Poultry',
     'Natures Foods',
+    'Tasfresh',
+    'Licensed Socks',
 }
 
 # Suppliers where the TIR invoice number differs from the email invoice number.
