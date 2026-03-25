@@ -18,7 +18,7 @@ _gmail_search_cache = {}  # (id(svc), query) -> list of message dicts
 
 MAX_RETRIES = 3
 RETRY_DELAYS = [2, 5, 10]
-MAX_WORKERS = 3   # parallel threads — kept low for Render free tier (512MB RAM)
+MAX_WORKERS = 10  # parallel threads — tuned for 16GB RAM iMac
 BATCH_SIZE = 10   # process invoices in batches to limit peak memory
 GMAIL_MAX_RESULTS = 30  # max emails per search — must be high enough for frequent senders like Tasfresh
 
