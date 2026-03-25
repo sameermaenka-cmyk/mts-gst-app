@@ -89,7 +89,7 @@ if uploaded_pdf:
             with c2:
                 st.metric("Total GST", f"${total_gst:,.2f}")
             with c3:
-                st.metric("TIR Total", f"${sum(r[3] for r in results):,.2f}")
+                st.metric("TIR Total", f"${sum(r[3] for r in results if r[2] != 'WEEKLY TOTAL'):,.2f}")
 
             # Results table
             verified_rows = [(r[0], r[1], r[2], f"${r[3]:,.2f}",

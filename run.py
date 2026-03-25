@@ -431,16 +431,23 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
             continue
 
         # Weekly invoice suppliers: one email covers all TIR items for the week.
-        # GST is distributed proportionally by each item's share of the weekly sum.
+        # Individual items get no GST; a weekly total row carries the actual GST.
         if supplier in WEEKLY_INVOICE_SUPPLIERS:
             cached = _weekly_cache.get((supplier, date))
             if cached:
-                weekly_gst, inv_total, weekly_sum, status = cached
-                if weekly_gst is not None and 'VERIFIED' in status and weekly_sum:
-                    gst = round(weekly_gst * tir_amount / weekly_sum, 2)
-                else:
-                    gst = weekly_gst
-            results.append((date, supplier, inv_no, tir_amount, gst, inv_total, status))
+                _, _, _, status = cached
+                # Individual line items: verified status but no GST
+                results.append((date, supplier, inv_no, tir_amount, None, None, status))
+            else:
+                results.append((date, supplier, inv_no, tir_amount, None, None, status))
+
+            # After the last item in this weekly group, insert a total row with actual GST
+            group_items = _weekly_groups.get((supplier, date), [])
+            last_inv = group_items[-1][0] if group_items else None
+            if inv_no == last_inv and cached:
+                weekly_gst, inv_total, weekly_sum, wk_status = cached
+                results.append((date, supplier, 'WEEKLY TOTAL', weekly_sum, weekly_gst, inv_total, wk_status))
+
             if progress_callback:
                 progress_callback(i + 1, total_count, supplier, inv_no, status)
             continue
@@ -554,15 +561,30 @@ def build_excel(results, title_date=''):
     total_gst = 0
     verified_count = 0
 
+    # Track which (supplier, date) weekly groups have been counted as verified
+    _weekly_verified = set()
+
     for date, supplier, inv_no, tir_amt, gst, inv_total, status in results:
+        is_weekly_total = inv_no == 'WEEKLY TOTAL'
         ws.append([date, supplier, inv_no, tir_amt, inv_total or '', gst or '', status])
         row = ws[ws.max_row]
-        if 'VERIFIED' in status:
+        if is_weekly_total:
+            # Bold the weekly total row; don't count towards total_count
+            for c in row:
+                c.fill = green if 'VERIFIED' in status else orange
+                c.font = Font(bold=True)
+            if gst:
+                total_gst += gst
+            if 'VERIFIED' in status:
+                _weekly_verified.add((supplier, date))
+        elif 'VERIFIED' in status:
             for c in row:
                 c.fill = green
             if gst:
                 total_gst += gst
-            verified_count += 1
+            if (supplier, date) not in _weekly_verified:
+                # Normal verified row (not part of a weekly group)
+                verified_count += 1
         elif 'PAPER INVOICE' in status:
             for c in row:
                 c.fill = grey
@@ -573,9 +595,16 @@ def build_excel(results, title_date=''):
             for c in row:
                 c.fill = red
 
+    # Count each verified weekly group as one
+    verified_count += len(_weekly_verified)
+    # Exclude WEEKLY TOTAL synthetic rows from TIR total sum
+    tir_total = sum(r[3] for r in results if r[2] != 'WEEKLY TOTAL')
+    # Exclude WEEKLY TOTAL rows from the total invoice count
+    invoice_count = sum(1 for r in results if r[2] != 'WEEKLY TOTAL')
+
     ws.append([])
-    ws.append(['', '', 'TOTALS', sum(r[3] for r in results), '', round(total_gst, 2),
-               f'{verified_count}/{total_count} verified'])
+    ws.append(['', '', 'TOTALS', tir_total, '', round(total_gst, 2),
+               f'{verified_count}/{invoice_count} verified'])
     for c in ws[ws.max_row]:
         c.font = Font(bold=True)
     for col, w in zip('ABCDEFG', [14, 20, 16, 16, 16, 16, 28]):
@@ -584,7 +613,7 @@ def build_excel(results, title_date=''):
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return buf.getvalue(), verified_count, total_count, total_gst
+    return buf.getvalue(), verified_count, invoice_count, total_gst
 
 
 # CLI entry point
