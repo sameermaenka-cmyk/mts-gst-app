@@ -51,6 +51,7 @@ SUPPLIER_QUERY = {
     'Pandani Select': 'from:pandaniselect.com.au subject:{inv}',
     'Savour Foods':   'from:savourfoods.com.au subject:{inv}',
     'Scottsdale Pork':'from:fresho.com subject:F{inv}',
+    'Natures Foods':  'subject:"From Natures Foods" has:attachment',
 }
 
 LABEL_QUERY = {
@@ -86,7 +87,6 @@ SUPPLIER_QUERY2 = {
     'Cartel & Co':      'from:cartelco.co has:attachment',
     'Licensed Socks':   'subject:{inv} has:attachment',
     'Horticultural L':  'from:dpritchard@hals.com.au subject:"HALS Invoice" has:attachment',
-    'Natures Foods':    'subject:{inv} has:attachment',
     'Olsen Eggs':       'subject:{inv} has:attachment',
     'Bega':             'from:noreplyBDD@bega.com.au has:attachment',
     'Bidfood':          'from:bidfood.com.au has:attachment',
@@ -129,6 +129,7 @@ INV_EMAIL_PREFIX = {
 # These need attachment-level matching instead of subject-based search.
 ATTACHMENT_MATCH_SUPPLIERS = {
     'Nichols Poultry',
+    'Natures Foods',
 }
 
 # Suppliers where the TIR invoice number differs from the email invoice number.
@@ -411,28 +412,37 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         # Skip email1 entirely for suppliers that only receive on email2
         if supplier not in EMAIL2_ONLY_SUPPLIERS:
             q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
-            queries_email1 = [q for q in [q_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au'] if q.strip()]
 
-            # Try label query on email 1
-            lq = LABEL_QUERY.get(supplier)
-            if lq:
-                g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
-                                             require_inv_in_text=needs_inv_check)
-                if s and 'VERIFIED' in s:
-                    gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
-                elif s and gst is None:
-                    gst, inv_total, status = g, t, s
-
-            # Try email 1 specific queries
-            for q in queries_email1:
-                if 'VERIFIED' in status:
-                    break
-                g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
-                                             require_inv_in_text=needs_inv_check)
+            # For suppliers with non-.pdf attachments (e.g. .p), match by filename
+            if supplier in ATTACHMENT_MATCH_SUPPLIERS and q_specific:
+                g, t, s = search_and_verify_by_attachment(svc1, q_specific, tir_amount, inv_no, client)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, s
                 elif s:
                     gst, inv_total, status = g, t, s
+            else:
+                queries_email1 = [q for q in [q_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au'] if q.strip()]
+
+                # Try label query on email 1
+                lq = LABEL_QUERY.get(supplier)
+                if lq:
+                    g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
+                                                 require_inv_in_text=needs_inv_check)
+                    if s and 'VERIFIED' in s:
+                        gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
+                    elif s and gst is None:
+                        gst, inv_total, status = g, t, s
+
+                # Try email 1 specific queries
+                for q in queries_email1:
+                    if 'VERIFIED' in status:
+                        break
+                    g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
+                                                 require_inv_in_text=needs_inv_check)
+                    if s and 'VERIFIED' in s:
+                        gst, inv_total, status = g, t, s
+                    elif s:
+                        gst, inv_total, status = g, t, s
 
         # Try email 2 if not verified yet
         if 'VERIFIED' not in status and svc2:
