@@ -93,7 +93,7 @@ SUPPLIER_QUERY2 = {
     'Nichols Poultry':  'subject:"Nichols Poultry" has:attachment',
     'PFD':              'from:pfdfoods.com.au has:attachment',
     'Petuna Fisherie':  'from:petuna has:attachment',
-    'Tasfresh':         'from:tasfresh.com.au has:attachment',
+    'Tasfresh':         'from:accounts.receivable@tasfresh.com.au has:attachment',
     'Scottsdale Pork':  'from:fresho.com subject:Invoice subject:F{inv} has:attachment',
     'Tas Bakeries':     'from:tasmanianbakeries.com.au has:attachment',
     'Sunrise Bakery':   'from:sunrise has:attachment',
@@ -255,11 +255,13 @@ def _gmail_search(svc, query, max_results=5):
                 lambda: svc.users().messages().list(userId='me', q=query, maxResults=max_results).execute(),
                 f"Gmail search '{query[:50]}'"
             ).get('messages', [])
+            # Only cache successful results — don't cache errors as empty
+            _gmail_search_cache[key] = msgs
+            return msgs
         except Exception as e:
             log.warning(f"Gmail search failed: {type(e).__name__}: {e}")
-            msgs = []
-        _gmail_search_cache[key] = msgs
-        return msgs
+            # Do NOT cache — transient errors should be retried on next call
+            return []
 
 
 def _gmail_get_message(svc, msg_id):
@@ -369,6 +371,7 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
     and the invoice number only appears in the attachment filename.
     """
     msgs = _gmail_search(svc, query)
+    log.info(f"search_and_verify_by_attachment: query='{query[:60]}' inv={inv_no} found {len(msgs)} messages")
 
     first_mismatch = None
     for m in msgs:
@@ -379,20 +382,34 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
             log.warning(f"search_and_verify_by_attachment({msg_id}): {type(e).__name__}: {e}")
             continue
 
-        # Scan all parts for attachments whose filename contains the invoice number
+        # Scan all parts (including top-level payload) for attachments containing invoice number
         matches = []
+        all_filenames = []  # for debug logging
 
         def scan(parts):
             for p in parts:
                 if p.get('parts'):
                     scan(p['parts'])
                 fname = p.get('filename', '')
-                if fname and inv_no in fname:
-                    aid = p.get('body', {}).get('attachmentId')
-                    if aid:
-                        matches.append((fname, aid))
+                if fname:
+                    all_filenames.append(fname)
+                    if inv_no in fname:
+                        aid = p.get('body', {}).get('attachmentId')
+                        if aid:
+                            matches.append((fname, aid))
 
-        scan(msg.get('payload', {}).get('parts', []))
+        # Scan nested parts AND the top-level payload itself
+        payload = msg.get('payload', {})
+        if payload.get('parts'):
+            scan(payload['parts'])
+        # Some emails have the attachment at the top level (single-part)
+        if payload.get('filename') and inv_no in payload.get('filename', ''):
+            aid = payload.get('body', {}).get('attachmentId')
+            if aid:
+                matches.append((payload['filename'], aid))
+
+        if not matches and all_filenames:
+            log.info(f"  msg {msg_id}: no inv_no match in filenames: {all_filenames[:5]}")
 
         for fname, aid in matches:
             try:
