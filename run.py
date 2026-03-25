@@ -23,7 +23,7 @@ BATCH_SIZE = 10   # process invoices in batches to limit peak memory
 
 
 def _retry(fn, description="operation"):
-    """Retry fn() on transient errors (rate limits, server errors)."""
+    """Retry fn() on transient errors (rate limits, server errors, auth errors)."""
     for attempt in range(MAX_RETRIES):
         try:
             return fn()
@@ -36,7 +36,11 @@ def _retry(fn, description="operation"):
             log.warning(f"{description}: server error, retrying in {delay}s (attempt {attempt+1})")
             time.sleep(delay)
         except HttpError as e:
-            if e.resp.status in (429, 500, 503):
+            if e.resp.status in (401, 403):
+                # Auth error — token may have expired mid-run, retry once
+                log.warning(f"{description}: Gmail auth error {e.resp.status}, retrying (attempt {attempt+1})")
+                time.sleep(1)
+            elif e.resp.status in (429, 500, 503):
                 delay = RETRY_DELAYS[attempt]
                 log.warning(f"{description}: Gmail {e.resp.status}, retrying in {delay}s (attempt {attempt+1})")
                 time.sleep(delay)
@@ -172,11 +176,23 @@ def get_api_key():
     raise ValueError("ANTHROPIC_API_KEY not found in environment or Streamlit secrets")
 
 
+def _refresh_creds(creds):
+    """Force-refresh OAuth credentials. Always refreshes if a refresh_token exists,
+    regardless of the expiry field — the stored expiry may be stale or unparsed."""
+    if creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            log.info("Gmail OAuth token refreshed successfully")
+        except Exception as e:
+            log.warning(f"Token refresh failed: {type(e).__name__}: {e}")
+            # If refresh fails but token might still work, continue anyway
+    return creds
+
+
 def get_service(token_path):
     """Build Gmail API service from a token file path."""
     creds = Credentials.from_authorized_user_file(token_path)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+    _refresh_creds(creds)
     return build('gmail', 'v1', credentials=creds)
 
 
@@ -191,8 +207,7 @@ def get_service_from_json(token_data):
     else:
         info = dict(token_data)
     creds = Credentials.from_authorized_user_info(info)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+    _refresh_creds(creds)
     return build('gmail', 'v1', credentials=creds)
 
 
