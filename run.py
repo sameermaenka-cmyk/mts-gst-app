@@ -52,6 +52,7 @@ SUPPLIER_QUERY = {
     'Savour Foods':   'from:savourfoods.com.au subject:{inv}',
     'Scottsdale Pork':'from:fresho.com subject:F{inv}',
     'Natures Foods':  'subject:"From Natures Foods" has:attachment',
+    'Tas Bakeries':   'from:tasmanianbakeries.com.au subject:"Invoice from Tasmanian Bakeries" has:attachment',
 }
 
 LABEL_QUERY = {
@@ -98,7 +99,6 @@ SUPPLIER_QUERY2 = {
 # These are skipped during Gmail search and marked PAPER INVOICE.
 PAPER_SUPPLIERS = {
     'Wayside Butcher',
-    'Tas Bakeries',
     'Sunrise Bakery',
     'Olsen Eggs',
     'Mountainvale',
@@ -264,7 +264,13 @@ def extract_gst_and_total(text, client):
     r = _retry(_call, "Claude extract GST")
     t = re.sub(r'```json|```', '', r.content[0].text).strip()
     d = json.loads(t[t.find('{'):t.rfind('}') + 1])
-    return d.get('total'), d.get('gst')
+    total = d.get('total')
+    gst = d.get('gst')
+    # Default GST to 0.0 when we successfully extracted a total — makes it clear
+    # the invoice was found but has no/zero GST, vs invoice not found (None).
+    if total is not None and gst is None:
+        gst = 0.0
+    return total, gst
 
 
 def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_text=False):
@@ -566,21 +572,24 @@ def build_excel(results, title_date=''):
 
     for date, supplier, inv_no, tir_amt, gst, inv_total, status in results:
         is_weekly_total = inv_no == 'WEEKLY TOTAL'
-        ws.append([date, supplier, inv_no, tir_amt, inv_total or '', gst or '', status])
+        # Show 0.00 for GST when invoice was found (gst is not None), blank when not found
+        gst_display = gst if gst is not None else ''
+        inv_display = inv_total if inv_total is not None else ''
+        ws.append([date, supplier, inv_no, tir_amt, inv_display, gst_display, status])
         row = ws[ws.max_row]
         if is_weekly_total:
             # Bold the weekly total row; don't count towards total_count
             for c in row:
                 c.fill = green if 'VERIFIED' in status else orange
                 c.font = Font(bold=True)
-            if gst:
+            if gst is not None:
                 total_gst += gst
             if 'VERIFIED' in status:
                 _weekly_verified.add((supplier, date))
         elif 'VERIFIED' in status:
             for c in row:
                 c.fill = green
-            if gst:
+            if gst is not None:
                 total_gst += gst
             if (supplier, date) not in _weekly_verified:
                 # Normal verified row (not part of a weekly group)
