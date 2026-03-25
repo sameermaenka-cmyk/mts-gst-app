@@ -75,7 +75,7 @@ LABEL_QUERY = {
 }
 
 SUPPLIER_QUERY2 = {
-    'Cripps Nu Bake':   'from:cripps.com.au has:attachment',
+    'Cripps Nu Bake':   'from:administration@cripps.com.au subject:"Cripps Invoice" has:attachment',
     'Wayside Butcher':  'from:wayside has:attachment',
     'Nichols Poultry':  'subject:"Invoice(s) from Nichols Poultry P/L" has:attachment',
     'PFD':              'from:pfdfoods.com.au has:attachment',
@@ -117,6 +117,7 @@ EMAIL2_ONLY_SUPPLIERS = {
     'Tasfresh',
     'Nichols Poultry',
     'Horticultural L',
+    'Cripps Nu Bake',
 }
 
 # Suppliers whose email invoice numbers have a prefix not in the TIR statement.
@@ -136,6 +137,13 @@ ATTACHMENT_MATCH_SUPPLIERS = {
 # Match by sender and approximate amount only — skip invoice-number-based fallback queries.
 AMOUNT_MATCH_SUPPLIERS = {
     'Horticultural L',
+}
+
+# Suppliers that send one weekly invoice covering multiple TIR line items.
+# All TIR amounts for the same (supplier, date) are summed and compared against
+# the single email invoice total. GST is distributed proportionally.
+WEEKLY_INVOICE_SUPPLIERS = {
+    'Cripps Nu Bake',
 }
 
 
@@ -389,6 +397,26 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
     results = []
     total_count = len(tir_data)
 
+    # --- Pre-process weekly invoice suppliers ---
+    # Group TIR entries by (supplier, date), search once per group, cache result.
+    _weekly_groups = {}  # (supplier, date) -> [(inv_no, tir_amount), ...]
+    for date, supplier, inv_no, tir_amount in tir_data:
+        if supplier in WEEKLY_INVOICE_SUPPLIERS:
+            _weekly_groups.setdefault((supplier, date), []).append((inv_no, tir_amount))
+
+    _weekly_cache = {}  # (supplier, date) -> (gst, inv_total, status)
+    for (supplier, date), items in _weekly_groups.items():
+        weekly_sum = sum(amt for _, amt in items)
+        # Try email2 for weekly invoice
+        svc = svc2 if supplier in EMAIL2_ONLY_SUPPLIERS and svc2 else svc1
+        q = SUPPLIER_QUERY2.get(supplier, SUPPLIER_QUERY.get(supplier, ''))
+        if svc and q:
+            g, t, s = search_and_verify(svc, q, weekly_sum, '', client)
+            if s:
+                tag = 'email2' if svc is svc2 else 'email1'
+                status_str = f'VERIFIED ✓ ({tag}, weekly)' if 'VERIFIED' in s else s
+                _weekly_cache[(supplier, date)] = (g, t, weekly_sum, status_str)
+
     for i, (date, supplier, inv_no, tir_amount) in enumerate(tir_data):
         gst = None
         inv_total = None
@@ -397,6 +425,21 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         # Skip paper-based suppliers — no email invoices exist
         if supplier in PAPER_SUPPLIERS:
             status = 'PAPER INVOICE'
+            results.append((date, supplier, inv_no, tir_amount, gst, inv_total, status))
+            if progress_callback:
+                progress_callback(i + 1, total_count, supplier, inv_no, status)
+            continue
+
+        # Weekly invoice suppliers: one email covers all TIR items for the week.
+        # GST is distributed proportionally by each item's share of the weekly sum.
+        if supplier in WEEKLY_INVOICE_SUPPLIERS:
+            cached = _weekly_cache.get((supplier, date))
+            if cached:
+                weekly_gst, inv_total, weekly_sum, status = cached
+                if weekly_gst is not None and 'VERIFIED' in status and weekly_sum:
+                    gst = round(weekly_gst * tir_amount / weekly_sum, 2)
+                else:
+                    gst = weekly_gst
             results.append((date, supplier, inv_no, tir_amount, gst, inv_total, status))
             if progress_callback:
                 progress_callback(i + 1, total_count, supplier, inv_no, status)
