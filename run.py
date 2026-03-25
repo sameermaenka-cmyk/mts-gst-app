@@ -1,4 +1,5 @@
 import os, base64, io, json, re, time, logging
+import concurrent.futures, threading
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
@@ -11,8 +12,13 @@ log = logging.getLogger(__name__)
 # Cache: msg_id -> list of extracted PDF text strings
 _pdf_text_cache = {}
 
+# Thread-safe Gmail search cache and lock (Gmail API client is NOT thread-safe)
+_gmail_lock = threading.Lock()
+_gmail_search_cache = {}  # (id(svc), query) -> list of message dicts
+
 MAX_RETRIES = 3
 RETRY_DELAYS = [2, 5, 10]
+MAX_WORKERS = 8  # parallel invoice processing threads
 
 
 def _retry(fn, description="operation"):
@@ -220,6 +226,41 @@ def get_services():
     return svc1, svc2
 
 
+def _gmail_search(svc, query, max_results=5):
+    """Thread-safe, cached Gmail search. Avoids redundant queries for the same supplier."""
+    key = (id(svc), query)
+    with _gmail_lock:
+        if key in _gmail_search_cache:
+            return _gmail_search_cache[key]
+        try:
+            msgs = _retry(
+                lambda: svc.users().messages().list(userId='me', q=query, maxResults=max_results).execute(),
+                f"Gmail search '{query[:50]}'"
+            ).get('messages', [])
+        except Exception as e:
+            log.warning(f"Gmail search failed: {type(e).__name__}: {e}")
+            msgs = []
+        _gmail_search_cache[key] = msgs
+        return msgs
+
+
+def _gmail_get_message(svc, msg_id):
+    """Thread-safe Gmail message fetch."""
+    with _gmail_lock:
+        return _retry(
+            lambda: svc.users().messages().get(userId='me', id=msg_id, format='full').execute(),
+            f"Gmail get message {msg_id}")
+
+
+def _gmail_get_attachment(svc, msg_id, att_id):
+    """Thread-safe Gmail attachment fetch."""
+    with _gmail_lock:
+        return _retry(
+            lambda aid=att_id, mid=msg_id: svc.users().messages().attachments().get(
+                userId='me', messageId=mid, id=aid).execute(),
+            f"Gmail get attachment {msg_id}")
+
+
 def read_pdfs(svc, msg_id):
     """Extract text from PDF attachments in a Gmail message. Results are cached by msg_id."""
     if msg_id in _pdf_text_cache:
@@ -227,9 +268,7 @@ def read_pdfs(svc, msg_id):
 
     texts = []
     try:
-        msg = _retry(
-            lambda: svc.users().messages().get(userId='me', id=msg_id, format='full').execute(),
-            f"Gmail get message {msg_id}")
+        msg = _gmail_get_message(svc, msg_id)
 
         def scan(parts):
             for p in parts:
@@ -238,10 +277,7 @@ def read_pdfs(svc, msg_id):
                 if p.get('filename', '').lower().endswith('.pdf'):
                     aid = p.get('body', {}).get('attachmentId')
                     if aid:
-                        att = _retry(
-                            lambda aid=aid: svc.users().messages().attachments().get(
-                                userId='me', messageId=msg_id, id=aid).execute(),
-                            f"Gmail get attachment {msg_id}")
+                        att = _gmail_get_attachment(svc, msg_id, aid)
                         data = base64.urlsafe_b64decode(att['data'])
                         with pdfplumber.open(io.BytesIO(data)) as pdf:
                             t = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
@@ -283,14 +319,7 @@ def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_tex
     text for a match to be accepted. This prevents summary emails (with a fixed
     total) from being mistaken for individual invoices.
     """
-    try:
-        msgs = _retry(
-            lambda: svc.users().messages().list(userId='me', q=query, maxResults=5).execute(),
-            f"Gmail search '{query[:50]}'"
-        ).get('messages', [])
-    except Exception as e:
-        log.warning(f"search_and_verify: Gmail search failed: {type(e).__name__}: {e}")
-        return None, None, None
+    msgs = _gmail_search(svc, query)
 
     for m in msgs:
         for txt in read_pdfs(svc, m['id']):
@@ -316,21 +345,12 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
     Used for suppliers like Nichols Poultry where every email has the same subject
     and the invoice number only appears in the attachment filename.
     """
-    try:
-        msgs = _retry(
-            lambda: svc.users().messages().list(userId='me', q=query, maxResults=5).execute(),
-            f"Gmail search '{query[:50]}'"
-        ).get('messages', [])
-    except Exception as e:
-        log.warning(f"search_and_verify_by_attachment: Gmail search failed: {type(e).__name__}: {e}")
-        return None, None, None
+    msgs = _gmail_search(svc, query)
 
     for m in msgs:
         msg_id = m['id']
         try:
-            msg = _retry(
-                lambda mid=msg_id: svc.users().messages().get(userId='me', id=mid, format='full').execute(),
-                f"Gmail get message {msg_id}")
+            msg = _gmail_get_message(svc, msg_id)
         except Exception as e:
             log.warning(f"search_and_verify_by_attachment({msg_id}): {type(e).__name__}: {e}")
             continue
@@ -352,10 +372,7 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
 
         for fname, aid in matches:
             try:
-                att = _retry(
-                    lambda aid=aid, mid=msg_id: svc.users().messages().attachments().get(
-                        userId='me', messageId=mid, id=aid).execute(),
-                    f"Gmail get attachment {fname}")
+                att = _gmail_get_attachment(svc, msg_id, aid)
                 data = base64.urlsafe_b64decode(att['data'])
                 with pdfplumber.open(io.BytesIO(data)) as pdf:
                     txt = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
@@ -393,30 +410,103 @@ def parse_tir_pdf(pdf_bytes, client):
     return [(row[0], row[1], str(row[2]), float(row[3])) for row in data]
 
 
+def _process_one_invoice(date, supplier, inv_no, tir_amount, svc1, svc2, client):
+    """Process a single invoice — search Gmail, extract GST, verify amount.
+
+    Returns (date, supplier, inv_no, tir_amount, gst, inv_total, status).
+    """
+    gst = None
+    inv_total = None
+    status = 'NOT FOUND'
+
+    needs_inv_check = supplier in SUMMARY_EMAIL_SUPPLIERS
+    email_inv_no = INV_EMAIL_PREFIX.get(supplier, '') + inv_no
+
+    # Try email 1
+    if supplier not in EMAIL2_ONLY_SUPPLIERS:
+        q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
+
+        if supplier in ATTACHMENT_MATCH_SUPPLIERS and q_specific:
+            g, t, s = search_and_verify_by_attachment(svc1, q_specific, tir_amount, inv_no, client)
+            if s and 'VERIFIED' in s:
+                gst, inv_total, status = g, t, s
+            elif s:
+                gst, inv_total, status = g, t, s
+        else:
+            queries_email1 = [q for q in [q_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au'] if q.strip()]
+
+            lq = LABEL_QUERY.get(supplier)
+            if lq:
+                g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
+                                             require_inv_in_text=needs_inv_check)
+                if s and 'VERIFIED' in s:
+                    gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
+                elif s and gst is None:
+                    gst, inv_total, status = g, t, s
+
+            for q in queries_email1:
+                if 'VERIFIED' in status:
+                    break
+                g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
+                                             require_inv_in_text=needs_inv_check)
+                if s and 'VERIFIED' in s:
+                    gst, inv_total, status = g, t, s
+                elif s:
+                    gst, inv_total, status = g, t, s
+
+    # Try email 2 if not verified yet
+    if 'VERIFIED' not in status and svc2:
+        q2_tmpl = SUPPLIER_QUERY2.get(supplier, f'subject:{email_inv_no} has:attachment')
+        q2_specific = q2_tmpl.replace('{inv}', inv_no)
+
+        if supplier in ATTACHMENT_MATCH_SUPPLIERS:
+            g, t, s = search_and_verify_by_attachment(svc2, q2_specific, tir_amount, inv_no, client)
+            if s and 'VERIFIED' in s:
+                gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
+            elif s and 'MISMATCH' not in status:
+                gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
+        elif supplier in AMOUNT_MATCH_SUPPLIERS:
+            g, t, s = search_and_verify(svc2, q2_specific, tir_amount, inv_no, client)
+            if s and 'VERIFIED' in s:
+                gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
+            elif s and 'MISMATCH' not in status:
+                gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
+        else:
+            queries_email2 = [q2_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au']
+            for q in queries_email2:
+                g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client,
+                                             require_inv_in_text=needs_inv_check)
+                if s and 'VERIFIED' in s:
+                    gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
+                    break
+                elif s and 'MISMATCH' not in status:
+                    gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
+
+    return (date, supplier, inv_no, tir_amount, gst, inv_total, status)
+
+
 def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
     """Run reconciliation on TIR data. Returns list of result tuples.
 
+    Processes invoices in parallel using a thread pool for speed.
     progress_callback(i, total, supplier, inv_no, status) is called after each invoice.
     """
-    # Single client reused for all Claude calls
     client = anthropic.Anthropic(api_key=api_key)
-    # Clear PDF text cache from any previous run
+    # Clear caches from any previous run
     _pdf_text_cache.clear()
+    _gmail_search_cache.clear()
 
-    results = []
     total_count = len(tir_data)
 
     # --- Pre-process weekly invoice suppliers ---
-    # Group TIR entries by (supplier, date), search once per group, cache result.
-    _weekly_groups = {}  # (supplier, date) -> [(inv_no, tir_amount), ...]
+    _weekly_groups = {}
     for date, supplier, inv_no, tir_amount in tir_data:
         if supplier in WEEKLY_INVOICE_SUPPLIERS:
             _weekly_groups.setdefault((supplier, date), []).append((inv_no, tir_amount))
 
-    _weekly_cache = {}  # (supplier, date) -> (gst, inv_total, status)
+    _weekly_cache = {}
     for (supplier, date), items in _weekly_groups.items():
         weekly_sum = sum(amt for _, amt in items)
-        # Try email2 for weekly invoice
         svc = svc2 if supplier in EMAIL2_ONLY_SUPPLIERS and svc2 else svc1
         q = SUPPLIER_QUERY2.get(supplier, SUPPLIER_QUERY.get(supplier, ''))
         if svc and q:
@@ -426,119 +516,66 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
                 status_str = f'VERIFIED ✓ ({tag}, weekly)' if 'VERIFIED' in s else s
                 _weekly_cache[(supplier, date)] = (g, t, weekly_sum, status_str)
 
-    for i, (date, supplier, inv_no, tir_amount) in enumerate(tir_data):
-        gst = None
-        inv_total = None
-        status = 'NOT FOUND'
+    # --- Build results: handle paper + weekly synchronously, parallelize the rest ---
+    results_map = {}  # index -> list of result tuples
+    futures = {}      # future -> (index, supplier, inv_no)
+    _progress_lock = threading.Lock()
+    _progress_counter = [0]  # mutable for closure
 
-        # Skip paper-based suppliers — no email invoices exist
-        if supplier in PAPER_SUPPLIERS:
-            status = 'PAPER INVOICE'
-            results.append((date, supplier, inv_no, tir_amount, gst, inv_total, status))
+    def _report_progress(supplier, inv_no, status):
+        with _progress_lock:
+            _progress_counter[0] += 1
             if progress_callback:
-                progress_callback(i + 1, total_count, supplier, inv_no, status)
-            continue
+                progress_callback(_progress_counter[0], total_count, supplier, inv_no, status)
 
-        # Weekly invoice suppliers: one email covers all TIR items for the week.
-        # Individual items get no GST; a weekly total row carries the actual GST.
-        if supplier in WEEKLY_INVOICE_SUPPLIERS:
-            cached = _weekly_cache.get((supplier, date))
-            if cached:
-                _, _, _, status = cached
-                # Individual line items: verified status but no GST
-                results.append((date, supplier, inv_no, tir_amount, None, None, status))
-            else:
-                results.append((date, supplier, inv_no, tir_amount, None, None, status))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i, (date, supplier, inv_no, tir_amount) in enumerate(tir_data):
 
-            # After the last item in this weekly group, insert a total row with actual GST
-            group_items = _weekly_groups.get((supplier, date), [])
-            last_inv = group_items[-1][0] if group_items else None
-            if inv_no == last_inv and cached:
-                weekly_gst, inv_total, weekly_sum, wk_status = cached
-                results.append((date, supplier, 'WEEKLY TOTAL', weekly_sum, weekly_gst, inv_total, wk_status))
+            # Paper suppliers — no API calls needed
+            if supplier in PAPER_SUPPLIERS:
+                results_map[i] = [(date, supplier, inv_no, tir_amount, None, None, 'PAPER INVOICE')]
+                _report_progress(supplier, inv_no, 'PAPER INVOICE')
+                continue
 
-            if progress_callback:
-                progress_callback(i + 1, total_count, supplier, inv_no, status)
-            continue
+            # Weekly suppliers — already resolved in pre-processing
+            if supplier in WEEKLY_INVOICE_SUPPLIERS:
+                rows = []
+                cached = _weekly_cache.get((supplier, date))
+                status = cached[3] if cached else 'NOT FOUND'
+                rows.append((date, supplier, inv_no, tir_amount, None, None, status))
 
-        # For summary-email suppliers, require invoice number in PDF text
-        # to avoid matching weekly summary emails with fixed totals
-        needs_inv_check = supplier in SUMMARY_EMAIL_SUPPLIERS
+                group_items = _weekly_groups.get((supplier, date), [])
+                last_inv = group_items[-1][0] if group_items else None
+                if inv_no == last_inv and cached:
+                    weekly_gst, inv_total, weekly_sum, wk_status = cached
+                    rows.append((date, supplier, 'WEEKLY TOTAL', weekly_sum, weekly_gst, inv_total, wk_status))
 
-        # Some suppliers prefix invoice numbers in emails (e.g. F51602430 vs TIR 51602430)
-        email_inv_no = INV_EMAIL_PREFIX.get(supplier, '') + inv_no
+                results_map[i] = rows
+                _report_progress(supplier, inv_no, status)
+                continue
 
-        # Skip email1 entirely for suppliers that only receive on email2
-        if supplier not in EMAIL2_ONLY_SUPPLIERS:
-            q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
+            # Normal suppliers — submit for parallel processing
+            future = executor.submit(
+                _process_one_invoice, date, supplier, inv_no, tir_amount, svc1, svc2, client)
+            futures[future] = (i, supplier, inv_no)
 
-            # For suppliers with non-.pdf attachments (e.g. .p), match by filename
-            if supplier in ATTACHMENT_MATCH_SUPPLIERS and q_specific:
-                g, t, s = search_and_verify_by_attachment(svc1, q_specific, tir_amount, inv_no, client)
-                if s and 'VERIFIED' in s:
-                    gst, inv_total, status = g, t, s
-                elif s:
-                    gst, inv_total, status = g, t, s
-            else:
-                queries_email1 = [q for q in [q_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au'] if q.strip()]
+        # Collect parallel results as they complete
+        for future in concurrent.futures.as_completed(futures):
+            idx, supplier, inv_no = futures[future]
+            try:
+                result = future.result()
+                results_map[idx] = [result]
+                _report_progress(supplier, inv_no, result[6])
+            except Exception as e:
+                log.error(f"Error processing {supplier} {inv_no}: {type(e).__name__}: {e}")
+                date, _, _, tir_amount = tir_data[idx]
+                results_map[idx] = [(date, supplier, inv_no, tir_amount, None, None, 'ERROR')]
+                _report_progress(supplier, inv_no, 'ERROR')
 
-                # Try label query on email 1
-                lq = LABEL_QUERY.get(supplier)
-                if lq:
-                    g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
-                                                 require_inv_in_text=needs_inv_check)
-                    if s and 'VERIFIED' in s:
-                        gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
-                    elif s and gst is None:
-                        gst, inv_total, status = g, t, s
-
-                # Try email 1 specific queries
-                for q in queries_email1:
-                    if 'VERIFIED' in status:
-                        break
-                    g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
-                                                 require_inv_in_text=needs_inv_check)
-                    if s and 'VERIFIED' in s:
-                        gst, inv_total, status = g, t, s
-                    elif s:
-                        gst, inv_total, status = g, t, s
-
-        # Try email 2 if not verified yet
-        if 'VERIFIED' not in status and svc2:
-            q2_tmpl = SUPPLIER_QUERY2.get(supplier, f'subject:{email_inv_no} has:attachment')
-            q2_specific = q2_tmpl.replace('{inv}', inv_no)
-
-            # For suppliers where the invoice number is in the attachment filename,
-            # use attachment-based matching instead of subject/text matching
-            if supplier in ATTACHMENT_MATCH_SUPPLIERS:
-                g, t, s = search_and_verify_by_attachment(svc2, q2_specific, tir_amount, inv_no, client)
-                if s and 'VERIFIED' in s:
-                    gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
-                elif s and 'MISMATCH' not in status:
-                    gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
-            elif supplier in AMOUNT_MATCH_SUPPLIERS:
-                # TIR invoice number differs from email — match by sender + amount only.
-                # Only use the specific supplier query; skip generic invoice-number fallback.
-                g, t, s = search_and_verify(svc2, q2_specific, tir_amount, inv_no, client)
-                if s and 'VERIFIED' in s:
-                    gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
-                elif s and 'MISMATCH' not in status:
-                    gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
-            else:
-                queries_email2 = [q2_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au']
-                for q in queries_email2:
-                    g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client,
-                                                 require_inv_in_text=needs_inv_check)
-                    if s and 'VERIFIED' in s:
-                        gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
-                        break
-                    elif s and 'MISMATCH' not in status:
-                        gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
-
-        results.append((date, supplier, inv_no, tir_amount, gst, inv_total, status))
-
-        if progress_callback:
-            progress_callback(i + 1, total_count, supplier, inv_no, status)
+    # Reassemble results in original TIR order
+    results = []
+    for i in range(len(tir_data)):
+        results.extend(results_map.get(i, []))
 
     return results
 
