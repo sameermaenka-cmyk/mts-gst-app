@@ -1,4 +1,4 @@
-import os, base64, io, json, re, time, logging
+import os, base64, gc, io, json, re, time, logging
 import concurrent.futures, threading
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -18,7 +18,8 @@ _gmail_search_cache = {}  # (id(svc), query) -> list of message dicts
 
 MAX_RETRIES = 3
 RETRY_DELAYS = [2, 5, 10]
-MAX_WORKERS = 8  # parallel invoice processing threads
+MAX_WORKERS = 3   # parallel threads — kept low for Render free tier (512MB RAM)
+BATCH_SIZE = 10   # process invoices in batches to limit peak memory
 
 
 def _retry(fn, description="operation"):
@@ -88,7 +89,7 @@ SUPPLIER_QUERY2 = {
     'Nichols Poultry':  'subject:"Nichols Poultry" has:attachment',
     'PFD':              'from:pfdfoods.com.au has:attachment',
     'Petuna Fisherie':  'from:petuna has:attachment',
-    'Tasfresh':         'from:accounts.receivable@tasfresh.com.au subject:"Tasfresh AR Invoice" has:attachment',
+    'Tasfresh':         'from:tasfresh.com.au has:attachment',
     'Scottsdale Pork':  'from:fresho.com subject:Invoice subject:F{inv} has:attachment',
     'Tas Bakeries':     'from:tasmanianbakeries.com.au has:attachment',
     'Sunrise Bakery':   'from:sunrise has:attachment',
@@ -526,11 +527,10 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
                 status_str = f'VERIFIED ✓ ({tag}, weekly)' if 'VERIFIED' in s else s
                 _weekly_cache[(supplier, date)] = (g, t, weekly_sum, status_str)
 
-    # --- Build results: handle paper + weekly synchronously, parallelize the rest ---
+    # --- Build results: handle paper + weekly synchronously, batch-parallelize the rest ---
     results_map = {}  # index -> list of result tuples
-    futures = {}      # future -> (index, supplier, inv_no)
     _progress_lock = threading.Lock()
-    _progress_counter = [0]  # mutable for closure
+    _progress_counter = [0]
 
     def _report_progress(supplier, inv_no, status):
         with _progress_lock:
@@ -538,49 +538,61 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
             if progress_callback:
                 progress_callback(_progress_counter[0], total_count, supplier, inv_no, status)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for i, (date, supplier, inv_no, tir_amount) in enumerate(tir_data):
+    # Separate items into instant (no API) and parallel (needs API) buckets
+    parallel_items = []  # (index, date, supplier, inv_no, tir_amount)
 
-            # Paper suppliers — no API calls needed
-            if supplier in PAPER_SUPPLIERS:
-                results_map[i] = [(date, supplier, inv_no, tir_amount, None, None, 'PAPER INVOICE')]
-                _report_progress(supplier, inv_no, 'PAPER INVOICE')
-                continue
+    for i, (date, supplier, inv_no, tir_amount) in enumerate(tir_data):
 
-            # Weekly suppliers — already resolved in pre-processing
-            if supplier in WEEKLY_INVOICE_SUPPLIERS:
-                rows = []
-                cached = _weekly_cache.get((supplier, date))
-                status = cached[3] if cached else 'NOT FOUND'
-                rows.append((date, supplier, inv_no, tir_amount, None, None, status))
+        # Paper suppliers — no API calls needed
+        if supplier in PAPER_SUPPLIERS:
+            results_map[i] = [(date, supplier, inv_no, tir_amount, None, None, 'PAPER INVOICE')]
+            _report_progress(supplier, inv_no, 'PAPER INVOICE')
+            continue
 
-                group_items = _weekly_groups.get((supplier, date), [])
-                last_inv = group_items[-1][0] if group_items else None
-                if inv_no == last_inv and cached:
-                    weekly_gst, inv_total, weekly_sum, wk_status = cached
-                    rows.append((date, supplier, 'WEEKLY TOTAL', weekly_sum, weekly_gst, inv_total, wk_status))
+        # Weekly suppliers — already resolved in pre-processing
+        if supplier in WEEKLY_INVOICE_SUPPLIERS:
+            rows = []
+            cached = _weekly_cache.get((supplier, date))
+            status = cached[3] if cached else 'NOT FOUND'
+            rows.append((date, supplier, inv_no, tir_amount, None, None, status))
 
-                results_map[i] = rows
-                _report_progress(supplier, inv_no, status)
-                continue
+            group_items = _weekly_groups.get((supplier, date), [])
+            last_inv = group_items[-1][0] if group_items else None
+            if inv_no == last_inv and cached:
+                weekly_gst, inv_total, weekly_sum, wk_status = cached
+                rows.append((date, supplier, 'WEEKLY TOTAL', weekly_sum, weekly_gst, inv_total, wk_status))
 
-            # Normal suppliers — submit for parallel processing
-            future = executor.submit(
-                _process_one_invoice, date, supplier, inv_no, tir_amount, svc1, svc2, client)
-            futures[future] = (i, supplier, inv_no)
+            results_map[i] = rows
+            _report_progress(supplier, inv_no, status)
+            continue
 
-        # Collect parallel results as they complete
-        for future in concurrent.futures.as_completed(futures):
-            idx, supplier, inv_no = futures[future]
-            try:
-                result = future.result()
-                results_map[idx] = [result]
-                _report_progress(supplier, inv_no, result[6])
-            except Exception as e:
-                log.error(f"Error processing {supplier} {inv_no}: {type(e).__name__}: {e}")
-                date, _, _, tir_amount = tir_data[idx]
-                results_map[idx] = [(date, supplier, inv_no, tir_amount, None, None, 'ERROR')]
-                _report_progress(supplier, inv_no, 'ERROR')
+        parallel_items.append((i, date, supplier, inv_no, tir_amount))
+
+    # Process remaining invoices in batches to limit peak memory on Render free tier
+    for batch_start in range(0, len(parallel_items), BATCH_SIZE):
+        batch = parallel_items[batch_start:batch_start + BATCH_SIZE]
+        futures = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for idx, date, supplier, inv_no, tir_amount in batch:
+                future = executor.submit(
+                    _process_one_invoice, date, supplier, inv_no, tir_amount, svc1, svc2, client)
+                futures[future] = (idx, date, supplier, inv_no, tir_amount)
+
+            for future in concurrent.futures.as_completed(futures):
+                idx, date, supplier, inv_no, tir_amount = futures[future]
+                try:
+                    result = future.result()
+                    results_map[idx] = [result]
+                    _report_progress(supplier, inv_no, result[6])
+                except Exception as e:
+                    # Error recovery: skip failed invoice instead of crashing
+                    log.error(f"Error processing {supplier} {inv_no}: {type(e).__name__}: {e}")
+                    results_map[idx] = [(date, supplier, inv_no, tir_amount, None, None, f'ERROR: {type(e).__name__}')]
+                    _report_progress(supplier, inv_no, 'ERROR')
+
+        # Force garbage collection between batches to free memory
+        gc.collect()
 
     # Reassemble results in original TIR order
     results = []
