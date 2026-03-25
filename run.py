@@ -20,6 +20,7 @@ MAX_RETRIES = 3
 RETRY_DELAYS = [2, 5, 10]
 MAX_WORKERS = 3   # parallel threads — kept low for Render free tier (512MB RAM)
 BATCH_SIZE = 10   # process invoices in batches to limit peak memory
+GMAIL_MAX_RESULTS = 30  # max emails per search — must be high enough for frequent senders like Tasfresh
 
 
 def _retry(fn, description="operation"):
@@ -244,7 +245,7 @@ def get_services():
     return svc1, svc2
 
 
-def _gmail_search(svc, query, max_results=5):
+def _gmail_search(svc, query, max_results=GMAIL_MAX_RESULTS):
     """Thread-safe, cached Gmail search. Avoids redundant queries for the same supplier."""
     key = (id(svc), query)
     with _gmail_lock:
