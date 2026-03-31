@@ -66,6 +66,7 @@ SUPPLIER_QUERY = {
     'Natures Foods':  'subject:"From Natures Foods" has:attachment',
     'Tas Bakeries':   'from:tasmanianbakeries.com.au subject:"Invoice from Tasmanian Bakeries" has:attachment',
     'Tas Gift Wrap':  'from:taswrap.com.au subject:INV{inv} has:attachment',
+    'PFD':            'from:pfdfoods.com.au subject:{inv}',
 }
 
 LABEL_QUERY = {
@@ -93,7 +94,6 @@ SUPPLIER_QUERY2 = {
     'Wayside Butcher':  'from:wayside has:attachment',
     'Nichols Poultry':  'subject:"Nichols Poultry" has:attachment',
     'PFD':              'from:pfdfoods.com.au has:attachment',
-    'Petuna Fisherie':  'from:petuna has:attachment',
     'Tasfresh':         'from:accounts.receivable@tasfresh.com.au has:attachment',
     'Scottsdale Pork':  'from:fresho.com subject:Invoice subject:F{inv} has:attachment',
     'Tas Bakeries':     'from:tasmanianbakeries.com.au has:attachment',
@@ -117,12 +117,17 @@ PAPER_SUPPLIERS = {
     'Mountainvale',
     'Packings',
     'Licensed Socks',
+    'Belle Esca',
+    'Petuna Fisherie',
 }
 
 # Suppliers known to send weekly summary emails rather than per-invoice PDFs.
 # For these, we require the invoice number to appear in the PDF text to avoid
 # matching the summary (which has a fixed total unrelated to individual invoices).
-SUMMARY_EMAIL_SUPPLIERS = set()
+SUMMARY_EMAIL_SUPPLIERS = {
+    'Tas Bakeries',  # each delivery has its own invoice email; match by SO number in PDF
+    'PFD',  # broad label query returns many PDFs; require VT/LT number in PDF text
+}
 
 # Suppliers whose invoices arrive on EMAIL2 only.
 # Skip email1 searches entirely for these to avoid wasting time.
@@ -132,7 +137,6 @@ EMAIL2_ONLY_SUPPLIERS = {
     'Horticultural L',
     'Cripps Nu Bake',
     'Natures Foods',
-    'Petuna Fisherie',
 }
 
 # Suppliers whose email invoice numbers have a prefix not in the TIR statement.
@@ -160,6 +164,11 @@ AMOUNT_MATCH_SUPPLIERS = {
 # the single email invoice total. GST is distributed proportionally.
 WEEKLY_INVOICE_SUPPLIERS = {
     'Cripps Nu Bake',
+}
+
+# Suppliers where the TIR invoice number has a prefix that should be stripped
+# before searching within PDF text (e.g. TIR "NV118608" → "118608" matches "SO118608" in PDF).
+INV_TIR_STRIP_PREFIX = {
     'Tas Bakeries',
 }
 
@@ -304,7 +313,21 @@ def read_pdfs(svc, msg_id):
                             t = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
                             if t.strip():
                                 texts.append(t)
-        scan(msg.get('payload', {}).get('parts', []))
+        payload = msg.get('payload', {})
+        scan(payload.get('parts', []))
+
+        # Handle single-part emails where the PDF IS the top-level payload
+        # (e.g. Lactalis sends emails where the entire payload is the PDF attachment)
+        if not texts and payload.get('filename', '').lower().endswith('.pdf'):
+            aid = payload.get('body', {}).get('attachmentId')
+            if aid:
+                att = _gmail_get_attachment(svc, msg_id, aid)
+                data = base64.urlsafe_b64decode(att['data'])
+                with pdfplumber.open(io.BytesIO(data)) as pdf:
+                    t = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
+                    if t.strip():
+                        texts.append(t)
+
     except (HttpError, Exception) as e:
         log.warning(f"read_pdfs({msg_id}): {type(e).__name__}: {e}")
 
@@ -312,8 +335,83 @@ def read_pdfs(svc, msg_id):
     return texts
 
 
-def extract_gst_and_total(text, client):
-    """Use Claude Haiku to extract total and GST from invoice text."""
+def _extract_with_regex(text, supplier=None):
+    """Extract total and GST using regex for known invoice formats.
+
+    Returns (total, gst) or (None, None) if no pattern matches.
+    Much faster and more reliable than LLM extraction for structured invoices.
+    """
+    if supplier == 'Cripps Nu Bake':
+        # Last page has "INVOICE TOTAL: 2903.93" or "INVOICE TOTAL: 227.42-" (credit)
+        m = re.search(r'INVOICE TOTAL:\s*([\d,]+\.\d{2})(-)?', text)
+        if m:
+            total = float(m.group(1).replace(',', ''))
+            if m.group(2):
+                total = -total
+            # GST from the last "Total ..." data row — second-to-last decimal number
+            gst = 0.0
+            for line_m in re.finditer(r'^Total\s+(.+)$', text, re.MULTILINE):
+                nums = re.findall(r'-?[\d,]+\.\d{2}', line_m.group(1))
+                if len(nums) >= 2:
+                    gst = float(nums[-2].replace(',', ''))
+            return total, gst
+
+    if supplier == 'Tas Bakeries':
+        # "Total $412.59" and "GST Total $37.53"
+        total_m = re.search(r'^\s*Total\s+\$([\d,]+\.\d{2})\s*$', text, re.MULTILINE)
+        gst_m = re.search(r'GST Total\s+\$([\d,]+\.\d{2})', text)
+        if total_m:
+            total = float(total_m.group(1).replace(',', ''))
+            gst = float(gst_m.group(1).replace(',', '')) if gst_m else 0.0
+            return total, gst
+
+    if supplier == 'PFD':
+        # "ORDER TOTAL (GST Included) $634.10" and "TOTAL GST $57.34"
+        total_m = re.search(r'ORDER TOTAL \(GST Included\)\s+\$?([\d,]+\.\d{2})', text)
+        gst_m = re.search(r'TOTAL GST\s+\$?([\d,]+\.\d{2})', text)
+        if total_m:
+            total = float(total_m.group(1).replace(',', ''))
+            gst = float(gst_m.group(1).replace(',', '')) if gst_m else 0.0
+            return total, gst
+
+    if supplier == 'Lactalis':
+        # "TOTAL AMOUNT: $ 119.74" and "Total of taxable supplies 83.20"
+        total_m = re.search(r'TOTAL AMOUNT:\s*\$\s*([\d,]+\.\d{2})', text)
+        if total_m:
+            total = float(total_m.group(1).replace(',', ''))
+            # "Total of taxable supplies" is GST-inclusive; GST = taxable / 11
+            taxable_m = re.search(r'Total of taxable supplies\s+([\d,]+\.\d{2})', text)
+            if taxable_m:
+                taxable = float(taxable_m.group(1).replace(',', ''))
+                gst = round(taxable / 11, 2)
+            else:
+                gst = 0.0
+            return total, gst
+
+    if supplier == 'Horticultural L':
+        # "Total 165.84 16.58 182.42" columns are Ex GST | GST | Inc GST
+        m = re.search(r'^Total\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})', text, re.MULTILINE)
+        if m:
+            gst = float(m.group(2).replace(',', ''))
+            total = float(m.group(3).replace(',', ''))
+            return total, gst
+
+    return None, None
+
+
+def extract_gst_and_total(text, client, supplier=None):
+    """Extract total and GST from invoice text.
+
+    Tries deterministic regex patterns first (fast, reliable for known formats),
+    then falls back to Claude Haiku for unknown formats.
+    """
+    # Try regex-based extraction first
+    total, gst = _extract_with_regex(text, supplier)
+    if total is not None:
+        log.info(f"extract_gst_and_total: regex matched for {supplier}: total={total}, gst={gst}")
+        return total, gst
+
+    # Fall back to Claude Haiku
     def _call():
         return client.messages.create(
             model='claude-haiku-4-5-20251001', max_tokens=150,
@@ -333,12 +431,13 @@ def extract_gst_and_total(text, client):
     return total, gst
 
 
-def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_text=False):
+def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_text=False, supplier=None):
     """Search Gmail for an invoice and verify the amount matches TIR.
 
     If require_inv_in_text is True, the invoice number must appear in the PDF
     text for a match to be accepted. This prevents summary emails (with a fixed
     total) from being mistaken for individual invoices.
+    For suppliers in INV_TIR_STRIP_PREFIX, the numeric part of inv_no is also tried.
     """
     msgs = _gmail_search(svc, query)
 
@@ -347,11 +446,15 @@ def search_and_verify(svc, query, tir_amount, inv_no, client, require_inv_in_tex
     first_mismatch = None
     for m in msgs:
         for txt in read_pdfs(svc, m['id']):
-            if require_inv_in_text and inv_no not in txt:
-                log.info(f"search_and_verify: skipping msg {m['id']} — inv {inv_no} not found in PDF text")
-                continue
+            if require_inv_in_text and inv_no:
+                # Also try the numeric-only part of the invoice number
+                # (e.g. TIR "NV118608" → "118608" matches "SO118608" in Tas Bakeries PDFs)
+                inv_num = re.sub(r'^[A-Za-z]+', '', inv_no)
+                if inv_no not in txt and inv_num not in txt:
+                    log.info(f"search_and_verify: skipping msg {m['id']} — inv {inv_no}/{inv_num} not found in PDF text")
+                    continue
             try:
-                t, g = extract_gst_and_total(txt, client)
+                t, g = extract_gst_and_total(txt, client, supplier=supplier)
                 if t is not None and abs(abs(t) - abs(tir_amount)) < 1.00:
                     return g, t, 'VERIFIED ✓'
                 elif t is not None and first_mismatch is None:
@@ -386,7 +489,7 @@ def _filename_matches_inv(fname, inv_no):
     return False
 
 
-def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
+def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client, supplier=None):
     """Search Gmail and match invoice by attachment filename (e.g. Invoice554148.P).
 
     Used for suppliers like Nichols Poultry where every email has the same subject
@@ -441,13 +544,67 @@ def search_and_verify_by_attachment(svc, query, tir_amount, inv_no, client):
                     txt = '\n'.join(pg.extract_text() or '' for pg in pdf.pages)
                 if not txt.strip():
                     continue
-                t, g = extract_gst_and_total(txt, client)
+                t, g = extract_gst_and_total(txt, client, supplier=supplier)
                 if t is not None and abs(abs(t) - abs(tir_amount)) < 1.00:
                     return g, t, 'VERIFIED ✓'
                 elif t is not None and first_mismatch is None:
                     first_mismatch = (g, t, f'AMOUNT MISMATCH (PDF:{t} TIR:{tir_amount})')
             except Exception as e:
                 log.warning(f"search_and_verify_by_attachment: error processing {fname} in {msg_id}: {e}")
+
+    if first_mismatch:
+        return first_mismatch
+    return None, None, None
+
+
+def search_and_verify_weekly(svc, query, weekly_sum, client, supplier=None):
+    """Search Gmail for a weekly invoice and verify the total matches TIR weekly sum.
+
+    Unlike search_and_verify, this sums ALL PDF totals within each email message
+    before comparing. This handles suppliers like Cripps that send a main invoice
+    plus a credit note as separate attachments in the same email.
+    """
+    msgs = _gmail_search(svc, query)
+    first_mismatch = None
+
+    for m in msgs:
+        texts = read_pdfs(svc, m['id'])
+        if not texts:
+            continue
+
+        msg_total = 0.0
+        msg_gst = 0.0
+        all_ok = True
+
+        for txt in texts:
+            try:
+                t, g = extract_gst_and_total(txt, client, supplier=supplier)
+                if t is not None:
+                    msg_total += t
+                    msg_gst += (g or 0.0)
+                else:
+                    all_ok = False
+            except Exception as e:
+                log.warning(f"search_and_verify_weekly: extract error for msg {m['id']}: {e}")
+                all_ok = False
+
+        if not all_ok or msg_total == 0.0 and len(texts) > 0:
+            # If we couldn't extract from all PDFs, also try each PDF individually
+            # (single-PDF emails still work)
+            for txt in texts:
+                try:
+                    t, g = extract_gst_and_total(txt, client, supplier=supplier)
+                    if t is not None and abs(abs(t) - abs(weekly_sum)) < 1.00:
+                        return g, t, 'VERIFIED ✓'
+                except Exception:
+                    pass
+            continue
+
+        if abs(abs(msg_total) - abs(weekly_sum)) < 1.00:
+            return msg_gst, msg_total, 'VERIFIED ✓'
+        elif first_mismatch is None:
+            first_mismatch = (msg_gst, msg_total,
+                              f'AMOUNT MISMATCH (PDF:{msg_total:.2f} TIR:{weekly_sum})')
 
     if first_mismatch:
         return first_mismatch
@@ -492,7 +649,7 @@ def _process_one_invoice(date, supplier, inv_no, tir_amount, svc1, svc2, client)
         q_specific = SUPPLIER_QUERY.get(supplier, '').replace('{inv}', inv_no)
 
         if supplier in ATTACHMENT_MATCH_SUPPLIERS and q_specific:
-            g, t, s = search_and_verify_by_attachment(svc1, q_specific, tir_amount, inv_no, client)
+            g, t, s = search_and_verify_by_attachment(svc1, q_specific, tir_amount, inv_no, client, supplier=supplier)
             if s and 'VERIFIED' in s:
                 gst, inv_total, status = g, t, s
             elif s:
@@ -503,7 +660,7 @@ def _process_one_invoice(date, supplier, inv_no, tir_amount, svc1, svc2, client)
             lq = LABEL_QUERY.get(supplier)
             if lq:
                 g, t, s = search_and_verify(svc1, lq, tir_amount, inv_no, client,
-                                             require_inv_in_text=needs_inv_check)
+                                             require_inv_in_text=needs_inv_check, supplier=supplier)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, 'VERIFIED ✓ (label)'
                 elif s and gst is None:
@@ -513,7 +670,7 @@ def _process_one_invoice(date, supplier, inv_no, tir_amount, svc1, svc2, client)
                 if 'VERIFIED' in status:
                     break
                 g, t, s = search_and_verify(svc1, q, tir_amount, inv_no, client,
-                                             require_inv_in_text=needs_inv_check)
+                                             require_inv_in_text=needs_inv_check, supplier=supplier)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, s
                 elif s:
@@ -525,13 +682,13 @@ def _process_one_invoice(date, supplier, inv_no, tir_amount, svc1, svc2, client)
         q2_specific = q2_tmpl.replace('{inv}', inv_no)
 
         if supplier in ATTACHMENT_MATCH_SUPPLIERS:
-            g, t, s = search_and_verify_by_attachment(svc2, q2_specific, tir_amount, inv_no, client)
+            g, t, s = search_and_verify_by_attachment(svc2, q2_specific, tir_amount, inv_no, client, supplier=supplier)
             if s and 'VERIFIED' in s:
                 gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
             elif s and 'MISMATCH' not in status:
                 gst, inv_total, status = g, t, f'MISMATCH email2 (PDF:{t} TIR:{tir_amount})'
         elif supplier in AMOUNT_MATCH_SUPPLIERS:
-            g, t, s = search_and_verify(svc2, q2_specific, tir_amount, inv_no, client)
+            g, t, s = search_and_verify(svc2, q2_specific, tir_amount, inv_no, client, supplier=supplier)
             if s and 'VERIFIED' in s:
                 gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
             elif s and 'MISMATCH' not in status:
@@ -540,7 +697,7 @@ def _process_one_invoice(date, supplier, inv_no, tir_amount, svc1, svc2, client)
             queries_email2 = [q2_specific, f'subject:{email_inv_no} has:attachment -from:tir.com.au']
             for q in queries_email2:
                 g, t, s = search_and_verify(svc2, q, tir_amount, inv_no, client,
-                                             require_inv_in_text=needs_inv_check)
+                                             require_inv_in_text=needs_inv_check, supplier=supplier)
                 if s and 'VERIFIED' in s:
                     gst, inv_total, status = g, t, 'VERIFIED ✓ (email2)'
                     break
@@ -575,7 +732,7 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
         svc = svc2 if supplier in EMAIL2_ONLY_SUPPLIERS and svc2 else svc1
         q = SUPPLIER_QUERY2.get(supplier, SUPPLIER_QUERY.get(supplier, ''))
         if svc and q:
-            g, t, s = search_and_verify(svc, q, weekly_sum, '', client)
+            g, t, s = search_and_verify_weekly(svc, q, weekly_sum, client, supplier=supplier)
             if s:
                 tag = 'email2' if svc is svc2 else 'email1'
                 status_str = f'VERIFIED ✓ ({tag}, weekly)' if 'VERIFIED' in s else s
@@ -596,6 +753,12 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
     parallel_items = []  # (index, date, supplier, inv_no, tir_amount)
 
     for i, (date, supplier, inv_no, tir_amount) in enumerate(tir_data):
+
+        # TIR internal charges — not supplier invoices (e.g. TIR-WklyPoster, TIR-MthCat)
+        if supplier.startswith('TIR-') or supplier.startswith('TIR '):
+            results_map[i] = [(date, supplier, inv_no, tir_amount, None, None, 'TIR INTERNAL')]
+            _report_progress(supplier, inv_no, 'TIR INTERNAL')
+            continue
 
         # Paper suppliers — no API calls needed
         if supplier in PAPER_SUPPLIERS:
@@ -680,6 +843,7 @@ def build_excel(results, title_date=''):
     orange = PatternFill('solid', start_color='FFF3E0')
     red = PatternFill('solid', start_color='FFEBEE')
     grey = PatternFill('solid', start_color='F5F5F5')
+    purple = PatternFill('solid', start_color='E8D5F5')
     total_gst = 0
     verified_count = 0
 
@@ -710,6 +874,9 @@ def build_excel(results, title_date=''):
             if (supplier, date) not in _weekly_verified:
                 # Normal verified row (not part of a weekly group)
                 verified_count += 1
+        elif 'TIR INTERNAL' in status:
+            for c in row:
+                c.fill = purple
         elif 'PAPER INVOICE' in status:
             for c in row:
                 c.fill = grey

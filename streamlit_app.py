@@ -27,7 +27,7 @@ with st.sidebar:
         svc1 = svc2 = None
         st.markdown(f"❌ Error: {e}")
     st.markdown("---")
-    st.markdown("🟢 **Green** = Verified\n\n🟠 **Orange** = Mismatch\n\n🔴 **Red** = Not found\n\n⬜ **Grey** = Paper invoice")
+    st.markdown("🟢 **Green** = Verified\n\n🟠 **Orange** = Mismatch\n\n🔴 **Red** = Not found\n\n⬜ **Grey** = Paper invoice\n\n🟣 **Purple** = TIR Internal")
     st.caption("MTS Ventures Pty Ltd | v1.0 | Contact Sameer")
 
 uploaded_pdf = st.file_uploader("📤 Upload TIR Statement PDF", type=["pdf"])
