@@ -760,30 +760,45 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
     _gmail_search_cache.clear()
 
     # --- Deduplicate TIR data ---
-    # Remove duplicates by (normalized_supplier, inv_no) and (normalized_supplier, amount).
-    # Normalize supplier name (strip, collapse whitespace, lowercase) to catch variations
-    # like "Cripps Nu Bake" vs "Cripps NuBake" that Claude may produce across pages.
+    # 1. Remove credit+replacement pairs: when the same (supplier, inv_no) has both
+    #    positive and negative amounts, it's a TIR adjustment (credit original, re-issue
+    #    with corrected amount). These net to near-zero and should be removed entirely.
+    # 2. Then deduplicate remaining rows by (supplier, inv_no).
+    # Normalize supplier names to catch variations ("Cripps Nu Bake" vs "Cripps NuBake").
     def _norm_supplier(s):
-        return re.sub(r'\s+', '', s).lower()  # "Cripps Nu Bake" → "crippsnubake"
+        return re.sub(r'\s+', '', s).lower()
 
+    # Phase 1: Identify invoice numbers that have mixed positive/negative entries
+    _inv_amounts = {}  # (norm_sup, inv_no) -> [amount1, amount2, ...]
+    for row in tir_data:
+        key = (_norm_supplier(row[1]), row[2].strip())
+        _inv_amounts.setdefault(key, []).append(row[3])
+
+    _mixed_sign_keys = set()
+    for key, amounts in _inv_amounts.items():
+        has_pos = any(a > 0 for a in amounts)
+        has_neg = any(a < 0 for a in amounts)
+        if has_pos and has_neg:
+            _mixed_sign_keys.add(key)
+            log.info(f"Dedup: credit+replacement pair {key} amounts={amounts} — removing all")
+
+    # Phase 2: Filter out credit+replacement pairs, then deduplicate by inv_no
     _seen_inv = set()
-    _seen_amt = set()
     deduped = []
     orig_count = len(tir_data)
     for row in tir_data:
         norm_sup = _norm_supplier(row[1])
         inv_no = row[2].strip()
-        amount = row[3]
-        key_inv = (norm_sup, inv_no)
-        key_amt = (norm_sup, amount)
-        if key_inv in _seen_inv or key_amt in _seen_amt:
-            log.info(f"Dedup: removing duplicate {row[1]} inv={inv_no} amt={amount}")
+        key = (norm_sup, inv_no)
+        if key in _mixed_sign_keys:
             continue
-        _seen_inv.add(key_inv)
-        _seen_amt.add(key_amt)
+        if key in _seen_inv:
+            continue
+        _seen_inv.add(key)
         deduped.append(row)
+
     if len(deduped) < orig_count:
-        log.info(f"Dedup: removed {orig_count - len(deduped)} duplicate entries")
+        log.info(f"Dedup: removed {orig_count - len(deduped)} of {orig_count} entries")
     tir_data = deduped
 
     total_count = len(tir_data)
