@@ -161,9 +161,7 @@ AMOUNT_MATCH_SUPPLIERS = {
 # Suppliers that send one weekly invoice covering multiple TIR line items.
 # All TIR amounts for the same (supplier, date) are summed and compared against
 # the single email invoice total. GST is distributed proportionally.
-WEEKLY_INVOICE_SUPPLIERS = {
-    'Cripps Nu Bake',
-}
+WEEKLY_INVOICE_SUPPLIERS = set()
 
 # Suppliers where the TIR invoice number has a prefix that should be stripped
 # before searching within PDF text (e.g. TIR "NV118608" → "118608" matches "SO118608" in PDF).
@@ -393,6 +391,35 @@ def _extract_with_regex(text, supplier=None):
         if m:
             gst = float(m.group(2).replace(',', ''))
             total = float(m.group(3).replace(',', ''))
+            return total, gst
+
+    if supplier == 'Tasfresh':
+        # Line items use no $ prefix; summary section has $GST, $freight, then $TOTAL
+        dollar_amounts = re.findall(r'\$([\d,]+\.\d{2})', text)
+        if len(dollar_amounts) >= 3:
+            total = float(dollar_amounts[-1].replace(',', ''))
+            gst = float(dollar_amounts[-3].replace(',', ''))
+            return total, gst
+        elif len(dollar_amounts) >= 1:
+            total = float(dollar_amounts[-1].replace(',', ''))
+            return total, 0.0
+
+    if supplier == 'News Corp':
+        # "Total of our Taxable Supplies to you $476.18 $47.59 $523.77"
+        # Columns: ex-GST, GST, total-inc-GST
+        m = re.search(r'Taxable Supplies to you\s+\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})', text)
+        if m:
+            gst = float(m.group(2).replace(',', ''))
+            total = float(m.group(3).replace(',', ''))
+            return total, gst
+
+    if supplier == 'IFP' or supplier == 'Freshline':
+        # "Total excluding GST 120.00\nGST 0.00\nTotal including GST 120.00"
+        total_m = re.search(r'Total including GST\s+([\d,]+\.\d{2})', text)
+        gst_m = re.search(r'^\s*GST\s+([\d,]+\.\d{2})\s*$', text, re.MULTILINE)
+        if total_m:
+            total = float(total_m.group(1).replace(',', ''))
+            gst = float(gst_m.group(1).replace(',', '')) if gst_m else 0.0
             return total, gst
 
     return None, None
@@ -778,23 +805,6 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
             _report_progress(supplier, inv_no, 'PAPER INVOICE')
             continue
 
-        # Weekly suppliers — already resolved in pre-processing
-        if supplier in WEEKLY_INVOICE_SUPPLIERS:
-            rows = []
-            cached = _weekly_cache.get((supplier, date))
-            status = cached[3] if cached else 'NOT FOUND'
-            rows.append((date, supplier, inv_no, tir_amount, None, None, status))
-
-            group_items = _weekly_groups.get((supplier, date), [])
-            last_inv = group_items[-1][0] if group_items else None
-            if inv_no == last_inv and cached:
-                weekly_gst, inv_total, weekly_sum, wk_status = cached
-                rows.append((date, supplier, 'WEEKLY TOTAL', weekly_sum, weekly_gst, inv_total, wk_status))
-
-            results_map[i] = rows
-            _report_progress(supplier, inv_no, status)
-            continue
-
         parallel_items.append((i, date, supplier, inv_no, tir_amount))
 
     # Process remaining invoices in batches to limit peak memory on Render free tier
@@ -859,33 +869,18 @@ def build_excel(results, title_date=''):
     total_gst = 0
     verified_count = 0
 
-    # Track which (supplier, date) weekly groups have been counted as verified
-    _weekly_verified = set()
-
     for date, supplier, inv_no, tir_amt, gst, inv_total, status in results:
-        is_weekly_total = inv_no == 'WEEKLY TOTAL'
         # Show 0.00 for GST when invoice was found (gst is not None), blank when not found
         gst_display = gst if gst is not None else ''
         inv_display = inv_total if inv_total is not None else ''
         ws.append([date, supplier, inv_no, tir_amt, inv_display, gst_display, status])
         row = ws[ws.max_row]
-        if is_weekly_total:
-            # Bold the weekly total row; don't count towards total_count
-            for c in row:
-                c.fill = green if 'VERIFIED' in status else orange
-                c.font = Font(bold=True)
-            if gst is not None:
-                total_gst += gst
-            if 'VERIFIED' in status:
-                _weekly_verified.add((supplier, date))
-        elif 'VERIFIED' in status:
+        if 'VERIFIED' in status:
             for c in row:
                 c.fill = green
             if gst is not None:
                 total_gst += gst
-            if (supplier, date) not in _weekly_verified:
-                # Normal verified row (not part of a weekly group)
-                verified_count += 1
+            verified_count += 1
         elif 'TIR INTERNAL' in status:
             for c in row:
                 c.fill = purple
@@ -899,12 +894,8 @@ def build_excel(results, title_date=''):
             for c in row:
                 c.fill = red
 
-    # Count each verified weekly group as one
-    verified_count += len(_weekly_verified)
-    # Exclude WEEKLY TOTAL synthetic rows from TIR total sum
-    tir_total = sum(r[3] for r in results if r[2] != 'WEEKLY TOTAL')
-    # Exclude WEEKLY TOTAL rows from the total invoice count
-    invoice_count = sum(1 for r in results if r[2] != 'WEEKLY TOTAL')
+    tir_total = sum(r[3] for r in results)
+    invoice_count = len(results)
 
     ws.append([])
     ws.append(['', '', 'TOTALS', tir_total, '', round(total_gst, 2),
