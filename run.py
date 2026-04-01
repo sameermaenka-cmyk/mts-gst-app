@@ -20,7 +20,7 @@ MAX_RETRIES = 3
 RETRY_DELAYS = [2, 5, 10]
 MAX_WORKERS = 10  # parallel threads — tuned for 16GB RAM iMac
 BATCH_SIZE = 10   # process invoices in batches to limit peak memory
-GMAIL_MAX_RESULTS = 30  # max emails per search — must be high enough for frequent senders like Tasfresh
+GMAIL_MAX_RESULTS = 100  # max emails per search — high enough for frequent senders like Tasfresh
 
 
 def _retry(fn, description="operation"):
@@ -66,6 +66,7 @@ SUPPLIER_QUERY = {
     'Natures Foods':  'subject:"From Natures Foods" has:attachment',
     'Tas Bakeries':   'from:tasmanianbakeries.com.au subject:"Invoice from Tasmanian Bakeries" has:attachment',
     'Tas Gift Wrap':  'from:taswrap.com.au subject:INV{inv} has:attachment',
+    'PFD':            'from:pfdfoods.com.au subject:"Sales Order" has:attachment',
 }
 
 LABEL_QUERY = {
@@ -758,14 +759,26 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
     _pdf_text_cache.clear()
     _gmail_search_cache.clear()
 
-    # --- Deduplicate TIR data: same (supplier, inv_no) may appear on multiple dates ---
-    _seen = set()
+    # --- Deduplicate TIR data ---
+    # Remove duplicates by (supplier, inv_no) — same invoice on multiple dates.
+    # Also remove duplicates by (supplier, amount) — same weekly total from different TIR periods.
+    # Normalize inv_no by stripping whitespace for consistent matching.
+    _seen_inv = set()
+    _seen_amt = set()
     deduped = []
+    orig_count = len(tir_data)
     for row in tir_data:
-        key = (row[1], row[2])  # (supplier, inv_no)
-        if key not in _seen:
-            _seen.add(key)
-            deduped.append(row)
+        supplier, inv_no, amount = row[1], row[2].strip(), row[3]
+        key_inv = (supplier, inv_no)
+        key_amt = (supplier, amount)
+        if key_inv in _seen_inv or key_amt in _seen_amt:
+            log.info(f"Dedup: removing duplicate {supplier} inv={inv_no} amt={amount}")
+            continue
+        _seen_inv.add(key_inv)
+        _seen_amt.add(key_amt)
+        deduped.append(row)
+    if len(deduped) < orig_count:
+        log.info(f"Dedup: removed {orig_count - len(deduped)} duplicate entries")
     tir_data = deduped
 
     total_count = len(tir_data)
