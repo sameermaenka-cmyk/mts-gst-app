@@ -123,9 +123,7 @@ PAPER_SUPPLIERS = {
 # Suppliers known to send weekly summary emails rather than per-invoice PDFs.
 # For these, we require the invoice number to appear in the PDF text to avoid
 # matching the summary (which has a fixed total unrelated to individual invoices).
-SUMMARY_EMAIL_SUPPLIERS = {
-    'Tas Bakeries',  # each delivery has its own invoice email; match by SO number in PDF
-}
+SUMMARY_EMAIL_SUPPLIERS = set()  # require inv number in PDF text — disabled, amount matching is sufficient
 
 # Suppliers whose invoices arrive on EMAIL2 only.
 # Skip email1 searches entirely for these to avoid wasting time.
@@ -155,7 +153,8 @@ ATTACHMENT_MATCH_SUPPLIERS = {
 # Match by sender and approximate amount only — skip invoice-number-based fallback queries.
 AMOUNT_MATCH_SUPPLIERS = {
     'Horticultural L',
-    'PFD',  # TIR uses LT numbers, PFD emails use VT numbers — different ID systems, match by amount only
+    'PFD',      # TIR uses LT numbers, PFD emails use VT numbers — different ID systems
+    'Lactalis',  # label query returns many emails; TIR inv numbers may not match email subjects
 }
 
 # Suppliers that send one weekly invoice covering multiple TIR line items.
@@ -758,6 +757,16 @@ def reconcile(tir_data, svc1, svc2, api_key, progress_callback=None):
     # Clear caches from any previous run
     _pdf_text_cache.clear()
     _gmail_search_cache.clear()
+
+    # --- Deduplicate TIR data: same (supplier, inv_no) may appear on multiple dates ---
+    _seen = set()
+    deduped = []
+    for row in tir_data:
+        key = (row[1], row[2])  # (supplier, inv_no)
+        if key not in _seen:
+            _seen.add(key)
+            deduped.append(row)
+    tir_data = deduped
 
     total_count = len(tir_data)
 
