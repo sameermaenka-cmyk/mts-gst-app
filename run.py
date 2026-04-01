@@ -652,6 +652,25 @@ def search_and_verify_weekly(svc, query, weekly_sum, client, supplier=None):
     return None, None, None
 
 
+# Normalize supplier names from Claude's PDF extraction to match code lookup keys.
+# Claude may output slight variations (apostrophes, spacing, abbreviation differences).
+SUPPLIER_NAME_MAP = {
+    "Nature's Foods": "Natures Foods",
+    "Natures Foods": "Natures Foods",
+    "Petuna Fisheries": "Petuna Fisherie",
+    "Horticultural Logistics": "Horticultural L",
+    "Pandani Select Meats": "Pandani Select",
+    "Scottsdale Pork": "Scottsdale Pork",
+}
+
+
+def _normalize_supplier(name):
+    """Normalize supplier name to match code lookup keys."""
+    if name in SUPPLIER_NAME_MAP:
+        return SUPPLIER_NAME_MAP[name]
+    return name
+
+
 def parse_tir_pdf(pdf_bytes, client):
     """Parse a TIR statement PDF into a list of (date, supplier, inv_no, amount) tuples."""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -662,7 +681,7 @@ def parse_tir_pdf(pdf_bytes, client):
             model='claude-sonnet-4-20250514', max_tokens=8000,
             messages=[{'role': 'user', 'content':
                 'Extract ALL invoice line items from this TIR statement. '
-                'For each line return: date (DD/MM/YYYY), supplier name, invoice number, and amount (as a number, negative for credits). '
+                'For each line return: date (DD/MM/YYYY), supplier name EXACTLY as printed, invoice number, and amount (as a number, negative for credits). '
                 'Return ONLY a JSON array of arrays: [["06/03/2026","Supplier Name","INV123",427.62], ...]\n'
                 'Include every single line item. Do not skip any.\n\n'
                 f'{full_text}'}])
@@ -670,7 +689,7 @@ def parse_tir_pdf(pdf_bytes, client):
     r = _retry(_call, "Claude parse TIR PDF")
     text = re.sub(r'```json|```', '', r.content[0].text).strip()
     data = json.loads(text[text.find('['):text.rfind(']') + 1])
-    return [(row[0], row[1], str(row[2]), float(row[3])) for row in data]
+    return [(row[0], _normalize_supplier(row[1]), str(row[2]), float(row[3])) for row in data]
 
 
 def _process_one_invoice(date, supplier, inv_no, tir_amount, svc1, svc2, client):
@@ -969,6 +988,9 @@ if __name__ == '__main__':
         ('06/03/2026','Bega','77007488',-620.05),('06/03/2026','Bidfood','69543372',220.27),
         ('06/03/2026','Bidfood','C6974657',42.12),('06/03/2026','Cartel & Co','IOA86090',530.13),
         ('06/03/2026','Cripps Nu Bake','925206',2614.83),('06/03/2026','Cripps Nu Bake','926026',2676.54),
+        # 13/03 Cripps reversals + re-issues (dedup removes these + the 06/03 originals above)
+        ('13/03/2026','Cripps Nu Bake','925206',2622.22),('13/03/2026','Cripps Nu Bake','925206',-2614.83),
+        ('13/03/2026','Cripps Nu Bake','926026',-2676.54),('13/03/2026','Cripps Nu Bake','926026',2679.87),
         ('06/03/2026','Eden Foods','RIN74955',2883.09),('06/03/2026','Eden Foods','RIN75028',74.79),
         ('06/03/2026','Eden Foods','RIN75153',115.74),('06/03/2026','Freshline','S338646',1641.11),
         ('06/03/2026','Freshline','S339355',2194.47),('06/03/2026','Freshline','S340009',2168.97),
@@ -996,18 +1018,25 @@ if __name__ == '__main__':
         ('06/03/2026','Tasfresh','2001714',50.00),('06/03/2026','Tasfresh','2001946',255.90),
         ('06/03/2026','Tasfresh','4526767',1061.28),('06/03/2026','Tasfresh','4526845',403.51),
         ('06/03/2026','Tasfresh','4527785',309.84),('06/03/2026','Tasfresh','4527940',1023.63),
+        ('06/03/2026','TIR-66583','386164',-1.69),('06/03/2026','TIR-66583','386330',-96.23),
+        ('06/03/2026','TIR-WklyPoster','386290',24.75),
         ('06/03/2026','Wayside Butcher','5735',2177.56),('06/03/2026','Wayside Butcher','5748',2389.72),
         ('13/03/2026','Ashgrove','725329',201.98),('13/03/2026','Ashgrove','726027',347.17),
         ('13/03/2026','Ashgrove','726936',653.63),('13/03/2026','Ashgrove','726937',404.27),
         ('13/03/2026','Bega','25949221',1014.21),('13/03/2026','Bega','25956542',918.53),
         ('13/03/2026','Bega','25956543',1714.83),('13/03/2026','Bega','25977037',475.17),
         ('13/03/2026','Bega','77036666',-935.44),('13/03/2026','Bidfood','69618480',726.82),
-        ('13/03/2026','Cripps Nu Bake','926886',2903.39),('13/03/2026','Eden Foods','RIN75406',2780.54),
+        ('13/03/2026','Cripps Nu Bake','926886',2903.39),
+        ('13/03/2026','Eden Foods','RIN75406',2780.54),
         ('13/03/2026','Freshline','S340947',1504.14),('13/03/2026','Goodman Fielder','98650450',539.82),
+        ('13/03/2026','IFP','1516689',-347.00),('13/03/2026','IFP','1516723',-24.60),
+        ('13/03/2026','IFP','1516813',-30.00),
         ('13/03/2026','IFP','M263173',162.10),('13/03/2026','IFP','M263187',1067.99),
         ('13/03/2026','IFP','M263348',1149.39),('13/03/2026','IFP','M263496',1396.67),
-        ('13/03/2026','IFP','M263663',2035.42),('13/03/2026','IFP','M263821',1261.29),
-        ('13/03/2026','IFP','M264035',1494.77),('13/03/2026','Juicy Isle','1445371',7683.71),
+        ('13/03/2026','IFP','M263663',2035.42),('13/03/2026','IFP','M263679',29.00),
+        ('13/03/2026','IFP','M263821',1261.29),('13/03/2026','IFP','M263845',140.00),
+        ('13/03/2026','IFP','M264035',1494.77),('13/03/2026','IFP','M264052',79.96),
+        ('13/03/2026','Juicy Isle','1445371',7683.71),
         ('13/03/2026','Juicy Isle','1445498',614.89),('13/03/2026','Juicy Isle','R1445371',-745.20),
         ('13/03/2026','Momentum Foods','10071798',643.88),('13/03/2026','Natures Foods','24807',476.80),
         ('13/03/2026','News Corp','8056663',477.07),('13/03/2026','Nichols Poultry','554360',260.42),
@@ -1022,6 +1051,7 @@ if __name__ == '__main__':
         ('13/03/2026','Tasfresh','4529197',286.88),('13/03/2026','Tasfresh','4529885',541.49),
         ('13/03/2026','Tasfresh','4529936',1422.92),('13/03/2026','Tasfresh','9185051',444.48),
         ('13/03/2026','Wayside Butcher','5764',1861.47),('13/03/2026','Wayside Butcher','5765',818.90),
+        ('13/03/2026','TIR-WklyPoster','386548',24.75),
         ('13/03/2026','Wayside Butcher','5781',2115.93),('13/03/2026','Wayside Butcher','5787',108.94),
     ]
 
