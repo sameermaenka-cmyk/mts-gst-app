@@ -394,15 +394,16 @@ def _extract_with_regex(text, supplier=None):
             return total, gst
 
     if supplier == 'Tasfresh':
-        # Line items use no $ prefix; summary section has $GST, $freight, then $TOTAL
-        dollar_amounts = re.findall(r'\$([\d,]+\.\d{2})', text)
-        if len(dollar_amounts) >= 3:
-            total = float(dollar_amounts[-1].replace(',', ''))
-            gst = float(dollar_amounts[-3].replace(',', ''))
+        # Two formats: LAU/ROB invoices use $ prefix ($0.00\n$0.00\nEOW...\n$879.39),
+        # FRS invoices use naked numbers (4.50\n0.41\nEOW...\n146.90).
+        # Match: GST\nfreight\nEOW terms\nTOTAL — with or without $ prefix.
+        m = re.search(
+            r'\$?([\d,]+\.\d{2})\s*\n\$?[\d,]+\.\d{2}\s*\nEOW.*?\n\$?([\d,]+\.\d{2})',
+            text, re.DOTALL)
+        if m:
+            gst = float(m.group(1).replace(',', ''))
+            total = float(m.group(2).replace(',', ''))
             return total, gst
-        elif len(dollar_amounts) >= 1:
-            total = float(dollar_amounts[-1].replace(',', ''))
-            return total, 0.0
 
     if supplier == 'News Corp':
         # "Total of our Taxable Supplies to you $476.18 $47.59 $523.77"
@@ -414,9 +415,10 @@ def _extract_with_regex(text, supplier=None):
             return total, gst
 
     if supplier == 'IFP' or supplier == 'Freshline':
-        # "Total excluding GST 120.00\nGST 0.00\nTotal including GST 120.00"
-        total_m = re.search(r'Total including GST\s+([\d,]+\.\d{2})', text)
-        gst_m = re.search(r'^\s*GST\s+([\d,]+\.\d{2})\s*$', text, re.MULTILINE)
+        # Standard: "Total including GST 120.00"  or  "Invoice Total inc GST -9.79"
+        # Handles both positive and negative (credit note) amounts.
+        total_m = re.search(r'(?:Total including GST|Invoice Total inc GST)\s+(-?[\d,]+\.\d{2})', text)
+        gst_m = re.search(r'^\s*GST\s+(-?[\d,]+\.\d{2})\s*$', text, re.MULTILINE)
         if total_m:
             total = float(total_m.group(1).replace(',', ''))
             gst = float(gst_m.group(1).replace(',', '')) if gst_m else 0.0
