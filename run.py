@@ -66,7 +66,6 @@ SUPPLIER_QUERY = {
     'Natures Foods':  'subject:"From Natures Foods" has:attachment',
     'Tas Bakeries':   'from:tasmanianbakeries.com.au subject:"Invoice from Tasmanian Bakeries" has:attachment',
     'Tas Gift Wrap':  'from:taswrap.com.au subject:INV{inv} has:attachment',
-    'PFD':            'from:pfdfoods.com.au subject:{inv}',
 }
 
 LABEL_QUERY = {
@@ -126,7 +125,6 @@ PAPER_SUPPLIERS = {
 # matching the summary (which has a fixed total unrelated to individual invoices).
 SUMMARY_EMAIL_SUPPLIERS = {
     'Tas Bakeries',  # each delivery has its own invoice email; match by SO number in PDF
-    'PFD',  # broad label query returns many PDFs; require VT/LT number in PDF text
 }
 
 # Suppliers whose invoices arrive on EMAIL2 only.
@@ -157,6 +155,7 @@ ATTACHMENT_MATCH_SUPPLIERS = {
 # Match by sender and approximate amount only — skip invoice-number-based fallback queries.
 AMOUNT_MATCH_SUPPLIERS = {
     'Horticultural L',
+    'PFD',  # TIR uses LT numbers, PFD emails use VT numbers — different ID systems, match by amount only
 }
 
 # Suppliers that send one weekly invoice covering multiple TIR line items.
@@ -602,7 +601,20 @@ def search_and_verify_weekly(svc, query, weekly_sum, client, supplier=None):
 
         if abs(abs(msg_total) - abs(weekly_sum)) < 1.00:
             return msg_gst, msg_total, 'VERIFIED ✓'
-        elif first_mismatch is None:
+
+        # If sum doesn't match but there are multiple PDFs (e.g. invoice + credit note),
+        # try matching individual PDFs. The credit note may be a separate TIR line item
+        # on a different date, so the TIR weekly sum may only cover the main invoice.
+        if len(texts) > 1:
+            for txt in texts:
+                try:
+                    t, g = extract_gst_and_total(txt, client, supplier=supplier)
+                    if t is not None and t > 0 and abs(abs(t) - abs(weekly_sum)) < 1.00:
+                        return g, t, 'VERIFIED ✓'
+                except Exception:
+                    pass
+
+        if first_mismatch is None:
             first_mismatch = (msg_gst, msg_total,
                               f'AMOUNT MISMATCH (PDF:{msg_total:.2f} TIR:{weekly_sum})')
 
